@@ -50,8 +50,8 @@ IP_DATA = {
     ENTER_CONTRACT_NUM, SELECT_COURSE, ENTER_COURSE_CUSTOM,
     ENTER_DATE_FROM, ENTER_DATE_TO, SELECT_BRANCH,
     ENTER_TOTAL_AMOUNT, ENTER_MONTH_AMOUNT, ENTER_DISCOUNT_AMOUNT,
-    ASK_SCHEDULE, ENTER_SCHEDULE, CONFIRM,
-) = range(15)
+    CONFIRM,
+) = range(13)
 
 COURSES = {
     "course_top": "ТОП школы (НИШ, БИЛ, РФМШ)",
@@ -388,68 +388,11 @@ async def enter_month_amount(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def enter_discount_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     val = update.message.text.strip()
     context.user_data['discount_amount'] = '' if val.lower() in ('нет','no','-','0') else val.replace(' ','').replace(',','')
-    keyboard = [
-        [InlineKeyboardButton("✅ Да, добавить график платежей", callback_data="schedule_yes")],
-        [InlineKeyboardButton("❌ Нет, без графика", callback_data="schedule_no")],
-    ]
-    await update.message.reply_text(
-        "📊 Нужен *график платежей* (Приложение 2)?",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode='Markdown'
-    )
-    return ASK_SCHEDULE
+    context.user_data['schedule'] = []
+    return await show_confirm(update.message, context)
 
 
-async def ask_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.data == "schedule_no":
-        context.user_data['schedule'] = []
-        await query.edit_message_text("✅ Без графика платежей.")
-        return await show_confirm(query.message, context)
-    else:
-        context.user_data['schedule'] = []
-        await query.edit_message_text(
-            "📊 Введите строки графика платежей.\n\n"
-            "Формат: `дата; сумма1; сумма2; итого`\n\n"
-            "Примеры:\n"
-            "`04.04.2026; 200000; ; `\n"
-            "`06.04.2026; ; 765000; 965000`\n\n"
-            "Когда закончите — напишите *готово*",
-            parse_mode='Markdown'
-        )
-        return ENTER_SCHEDULE
 
-
-async def enter_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text.lower() == 'готово':
-        if not context.user_data.get('schedule'):
-            await update.message.reply_text("⚠️ Добавьте хотя бы одну строку или нажмите /cancel")
-            return ENTER_SCHEDULE
-        return await show_confirm(update.message, context)
-
-    parts = [p.strip() for p in text.split(';')]
-    if len(parts) < 2:
-        await update.message.reply_text(
-            "⚠️ Неверный формат. Используйте: `дата; сумма1; сумма2; итого`",
-            parse_mode='Markdown'
-        )
-        return ENTER_SCHEDULE
-
-    row = {
-        'date': parts[0] if len(parts) > 0 else '',
-        'amount1': parts[1].replace(' ','') if len(parts) > 1 and parts[1] else '',
-        'amount2': parts[2].replace(' ','') if len(parts) > 2 and parts[2] else '',
-        'total': parts[3].replace(' ','') if len(parts) > 3 and parts[3] else '',
-    }
-    context.user_data['schedule'].append(row)
-    count = len(context.user_data['schedule'])
-    await update.message.reply_text(
-        f"✅ Строка {count} добавлена: {parts[0]}\n\nДобавьте следующую или напишите *готово*",
-        parse_mode='Markdown'
-    )
-    return ENTER_SCHEDULE
 
 
 async def show_confirm(message, context):
@@ -457,9 +400,6 @@ async def show_confirm(message, context):
     ip = IP_DATA[d.get('ip', 'mahsutov')]
     disc = d.get('discount_amount', '')
     disc_line = f"\n🎁 Скидка: {fmt_amount(disc)}" if disc else ""
-    sched = d.get('schedule', [])
-    sched_line = f"\n📊 График: {len(sched)} строк" if sched else "\n📊 Без графика платежей"
-
     summary = (
         f"📋 *Проверьте данные:*\n\n"
         f"🏢 ИП: {ip['label']}\n"
@@ -476,7 +416,7 @@ async def show_confirm(message, context):
         f"🪪 ИИН: {d.get('child_iin','—')}\n\n"
         f"💰 Сумма: {fmt_amount(d.get('total_amount','0'))}\n"
         f"📆 В месяц: {fmt_amount(d.get('month_amount','0'))}"
-        f"{disc_line}{sched_line}"
+        f"{disc_line}"
     )
 
     keyboard = [
@@ -539,8 +479,6 @@ def main():
             ENTER_TOTAL_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_total_amount)],
             ENTER_MONTH_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_month_amount)],
             ENTER_DISCOUNT_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_discount_amount)],
-            ASK_SCHEDULE: [CallbackQueryHandler(ask_schedule, pattern="^schedule_")],
-            ENTER_SCHEDULE: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_schedule)],
             CONFIRM: [CallbackQueryHandler(confirm, pattern="^confirm_")],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
