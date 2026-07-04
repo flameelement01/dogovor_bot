@@ -46,12 +46,12 @@ IP_DATA = {
 }
 
 (
-    SELECT_IP, UPLOAD_PARENT_PDF, UPLOAD_CHILD_PDF,
+    SELECT_IP, SELECT_CONTRACT_TYPE, UPLOAD_PARENT_PDF, UPLOAD_CHILD_PDF,
     ENTER_CONTRACT_NUM, SELECT_COURSE, ENTER_COURSE_CUSTOM,
     ENTER_DATE_FROM, ENTER_DATE_TO, SELECT_BRANCH,
     ENTER_TOTAL_AMOUNT, ENTER_MONTH_AMOUNT, ENTER_DISCOUNT_AMOUNT,
     CONFIRM,
-) = range(13)
+) = range(14)
 
 COURSES = {
     "course_top": "ТОП школы (НИШ, БИЛ, РФМШ)",
@@ -229,8 +229,26 @@ async def select_ip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ip_key = query.data.replace("ip_", "")
     context.user_data['ip'] = ip_key
     ip = IP_DATA[ip_key]
+    keyboard = [
+        [InlineKeyboardButton("Обычный договор", callback_data="type_regular")],
+        [InlineKeyboardButton("Для выпускных классов (6/11 класс)", callback_data="type_graduate")],
+    ]
     await query.edit_message_text(
-        f"✅ Выбрано: *{ip['label']}*\n\n📄 Отправьте PDF или фото *удостоверения личности родителя*",
+        f"✅ Выбрано: *{ip['label']}*\n\n📋 Выберите *тип договора*:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+    return SELECT_CONTRACT_TYPE
+
+
+async def select_contract_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    contract_type = 'graduate' if query.data == 'type_graduate' else 'regular'
+    context.user_data['contract_type'] = contract_type
+    label = 'Для выпускных классов (6/11 класс)' if contract_type == 'graduate' else 'Обычный'
+    await query.edit_message_text(
+        f"✅ Тип: *{label}*\n\n📄 Отправьте PDF или фото *удостоверения личности родителя*",
         parse_mode='Markdown'
     )
     return UPLOAD_PARENT_PDF
@@ -490,6 +508,7 @@ def main():
         entry_points=[CommandHandler("start", start)],
         states={
             SELECT_IP: [CallbackQueryHandler(select_ip, pattern="^ip_")],
+            SELECT_CONTRACT_TYPE: [CallbackQueryHandler(select_contract_type, pattern="^type_")],
             UPLOAD_PARENT_PDF: [
                 MessageHandler(filters.Document.PDF | filters.Document.IMAGE | filters.PHOTO, upload_parent_pdf)
             ],

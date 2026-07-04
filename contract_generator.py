@@ -317,6 +317,11 @@ def generate_contract(data, template_path):
     if len(br) > 2:
         br[2].text = ', ' + branch
 
+    # Remove пункт 5 (Заморозка) for graduating classes (6/11 grade)
+    if data.get('contract_type') == 'graduate' and len(tbl1.rows) > 5:
+        tr = tbl1.rows[5]._tr
+        tr.getparent().remove(tr)
+
     # === P153: Appendix 1 date ===
     if cd:
         p153 = paras[153]
