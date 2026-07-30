@@ -199,6 +199,7 @@ def fetch_deal(deal_id):
                 data['parent_phone'] = _field_value(ccfv, FC_PHONE)
                 data['parent_doc_num'] = str(_field_value(ccfv, FC_PARENT_DOC_NUM) or '') or None
                 data['parent_doc_date'] = _ts_to_date(_field_value(ccfv, FC_PARENT_DOC_DATE))
+                data['_contact_city'] = _field_value(ccfv, 893245)  # Город
         except Exception:
             pass
 
