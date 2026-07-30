@@ -241,7 +241,9 @@ async def select_ip(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def enter_parent_doc_num(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['parent_doc_num'] = update.message.text.strip()
+    val = update.message.text.strip()
+    context.user_data['parent_doc_num'] = val
+    amo.update_contact(context.user_data.get('_contact_id'), doc_num=val)
     return await _next_step(update.message, context)
 
 
@@ -254,6 +256,7 @@ async def enter_parent_doc_date(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return ENTER_PARENT_DOC_DATE
     context.user_data['parent_doc_date'] = val
+    amo.update_contact(context.user_data.get('_contact_id'), doc_date_str=val)
     return await _next_step(update.message, context)
 
 
@@ -267,6 +270,10 @@ async def enter_month_amount(update: Update, context: ContextTypes.DEFAULT_TYPE)
     total = calc_total(val, d.get('date_from', ''), d.get('date_to', ''))
     if total:
         context.user_data['total_amount'] = total
+    try:
+        amo.update_deal_month(int(d.get('contract_num', 0) or 0), val)
+    except Exception:
+        pass
     return await _next_step(update.message, context)
 
 
@@ -324,6 +331,18 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             caption=f"✅ *Договор готов!* `{filename}`\n\nДля нового договора — /start",
             parse_mode='Markdown'
         )
+        # Add note to AMO deal
+        d = context.user_data
+        try:
+            deal_id = int(d.get('contract_num', 0) or 0)
+            note = (
+                f"✅ Договор сгенерирован {d.get('contract_date','')}\n"
+                f"Клиент: {d.get('parent_fio','')} / {d.get('child_fio','')}\n"
+                f"Сумма: {d.get('total_amount','')} тг | Месяц: {d.get('month_amount','')} тг"
+            )
+            amo.add_note(deal_id, note)
+        except Exception:
+            pass
     except Exception as e:
         logger.error(f"Generation error: {e}")
         await query.message.reply_text(f"❌ Ошибка: {e}\n\nПопробуйте /start")

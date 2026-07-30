@@ -181,9 +181,11 @@ def fetch_deal(deal_id):
     }
 
     # Fetch contact for parent data
+    data['_contact_id'] = None
     contacts = (lead.get('_embedded') or {}).get('contacts') or []
     if contacts:
         cid = contacts[0]['id']
+        data['_contact_id'] = cid
         try:
             rc = requests.get(
                 f'https://{DOMAIN}/api/v4/contacts/{cid}?with=custom_fields_values',
@@ -201,3 +203,61 @@ def fetch_deal(deal_id):
             pass
 
     return data, None
+
+
+def update_contact(contact_id, doc_num=None, doc_date_str=None):
+    """Write parent passport fields back to AMO contact."""
+    if not contact_id:
+        return
+    fields = []
+    if doc_num:
+        try:
+            fields.append({'field_id': FC_PARENT_DOC_NUM, 'values': [{'value': int(doc_num)}]})
+        except ValueError:
+            fields.append({'field_id': FC_PARENT_DOC_NUM, 'values': [{'value': doc_num}]})
+    if doc_date_str:
+        try:
+            ts = int(datetime.strptime(doc_date_str, '%d.%m.%Y').timestamp())
+            fields.append({'field_id': FC_PARENT_DOC_DATE, 'values': [{'value': ts}]})
+        except Exception:
+            pass
+    if not fields:
+        return
+    try:
+        requests.patch(
+            f'https://{DOMAIN}/api/v4/contacts',
+            json=[{'id': contact_id, 'custom_fields_values': fields}],
+            headers=_headers(), timeout=10
+        )
+    except Exception:
+        pass
+
+
+def update_deal_month(deal_id, month_amount):
+    """Write month amount back to AMO deal field."""
+    if not deal_id or not month_amount:
+        return
+    try:
+        requests.patch(
+            f'https://{DOMAIN}/api/v4/leads',
+            json=[{'id': deal_id, 'custom_fields_values': [
+                {'field_id': F_MONTH_AMOUNT, 'values': [{'value': str(month_amount)}]}
+            ]}],
+            headers=_headers(), timeout=10
+        )
+    except Exception:
+        pass
+
+
+def add_note(deal_id, text):
+    """Add a text note to a deal."""
+    if not deal_id:
+        return
+    try:
+        requests.post(
+            f'https://{DOMAIN}/api/v4/leads/{deal_id}/notes',
+            json=[{'entity_id': deal_id, 'note_type': 'common', 'params': {'text': text}}],
+            headers=_headers(), timeout=10
+        )
+    except Exception:
+        pass
