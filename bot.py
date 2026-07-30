@@ -51,13 +51,12 @@ IP_DATA = {
 (
     ENTER_DEAL_ID,
     SELECT_IP,
-    SELECT_CONTRACT_TYPE,
     ENTER_PARENT_DOC_NUM,
     ENTER_PARENT_DOC_DATE,
+    ENTER_TOTAL_AMOUNT,
     ENTER_MONTH_AMOUNT,
-    ENTER_DISCOUNT_AMOUNT,
     CONFIRM,
-) = range(8)
+) = range(7)
 
 
 # ==================== HELPERS ====================
@@ -155,28 +154,18 @@ async def _next_step(msg, context):
         )
         return ENTER_PARENT_DOC_DATE
 
+    if not d.get('total_amount'):
+        disc = d.get('discount_amount', '')
+        hint = f"\n\n_(Сумма со скидкой из AMO: {fmt_amount(disc)})_" if disc else ""
+        await msg.reply_text(
+            f"💰 Введите *общую сумму договора* (без скидки, только цифры):{hint}",
+            parse_mode='Markdown'
+        )
+        return ENTER_TOTAL_AMOUNT
+
     if not d.get('month_amount'):
-        await msg.reply_text("💰 Введите *сумму в месяц* (только цифры):", parse_mode='Markdown')
+        await msg.reply_text("📆 Введите *сумму в месяц* (только цифры):", parse_mode='Markdown')
         return ENTER_MONTH_AMOUNT
-
-    if d.get('discount_amount') is None:
-        await msg.reply_text(
-            "🎁 Введите *сумму со скидкой* (цифры или *нет* если без акции):",
-            parse_mode='Markdown'
-        )
-        return ENTER_DISCOUNT_AMOUNT
-
-    if not d.get('contract_type'):
-        keyboard = [
-            [InlineKeyboardButton("Обычный договор", callback_data="type_regular")],
-            [InlineKeyboardButton("Для выпускных классов (6/11 класс)", callback_data="type_graduate")],
-        ]
-        await msg.reply_text(
-            "📋 Выберите *тип договора*:",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='Markdown'
-        )
-        return SELECT_CONTRACT_TYPE
 
     return await show_confirm(msg, context)
 
@@ -206,12 +195,9 @@ async def enter_deal_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ {error}\n\nПопробуйте другой номер или введите /cancel")
         return ENTER_DEAL_ID
 
-    # Populate user_data with what was found
-    context.user_data.update({k: v for k, v in data.items() if v is not None})
+    # Populate user_data with all fetched values (including None-valued ones)
+    context.user_data.update(data)
     context.user_data['contract_date'] = date.today().strftime('%d.%m.%Y')
-    # discount_amount stays None until the step, so we track explicitly
-    if 'discount_amount' not in context.user_data:
-        context.user_data['discount_amount'] = None
 
     # Build summary of what was fetched
     d = context.user_data
@@ -245,16 +231,6 @@ async def select_ip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await _next_step(query.message, context)
 
 
-async def select_contract_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    contract_type = 'graduate' if query.data == 'type_graduate' else 'regular'
-    context.user_data['contract_type'] = contract_type
-    label = 'Для выпускных классов (6/11 класс)' if contract_type == 'graduate' else 'Обычный'
-    await query.edit_message_text(f"✅ Тип: *{label}*", parse_mode='Markdown')
-    return await _next_step(query.message, context)
-
-
 async def enter_parent_doc_num(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['parent_doc_num'] = update.message.text.strip()
     return await _next_step(update.message, context)
@@ -272,6 +248,15 @@ async def enter_parent_doc_date(update: Update, context: ContextTypes.DEFAULT_TY
     return await _next_step(update.message, context)
 
 
+async def enter_total_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    val = update.message.text.strip().replace(' ', '').replace(',', '')
+    if not val.isdigit():
+        await update.message.reply_text("⚠️ Введите только цифры!\n\nПример: 1066500")
+        return ENTER_TOTAL_AMOUNT
+    context.user_data['total_amount'] = val
+    return await _next_step(update.message, context)
+
+
 async def enter_month_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     val = update.message.text.strip().replace(' ', '').replace(',', '')
     if not val.isdigit():
@@ -281,19 +266,13 @@ async def enter_month_amount(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return await _next_step(update.message, context)
 
 
-async def enter_discount_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    val = update.message.text.strip()
-    context.user_data['discount_amount'] = '' if val.lower() in ('нет', 'no', '-', '0') else val.replace(' ', '').replace(',', '')
-    return await _next_step(update.message, context)
-
-
 async def show_confirm(msg, context):
     d = context.user_data
     ip = IP_DATA.get(d.get('ip', 'mahsutov'), IP_DATA['mahsutov'])
     disc = d.get('discount_amount', '')
-    disc_line = f"\n🎁 Скидка: {fmt_amount(disc)}" if disc else ""
+    disc_line = f"\n🎁 Со скидкой: {fmt_amount(disc)}" if disc else ""
     ct = d.get('contract_type', 'regular')
-    ct_label = 'Выпускные классы (6/11)' if ct == 'graduate' else 'Обычный'
+    ct_label = 'Выпускные классы (5/10/11/12)' if ct == 'graduate' else 'Обычный'
     summary = (
         f"📋 *Проверьте данные:*\n\n"
         f"🏢 ИП: {ip['label']}\n"
@@ -359,11 +338,10 @@ def main():
         states={
             ENTER_DEAL_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_deal_id)],
             SELECT_IP: [CallbackQueryHandler(select_ip, pattern="^ip_")],
-            SELECT_CONTRACT_TYPE: [CallbackQueryHandler(select_contract_type, pattern="^type_")],
             ENTER_PARENT_DOC_NUM: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_parent_doc_num)],
             ENTER_PARENT_DOC_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_parent_doc_date)],
+            ENTER_TOTAL_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_total_amount)],
             ENTER_MONTH_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_month_amount)],
-            ENTER_DISCOUNT_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_discount_amount)],
             CONFIRM: [CallbackQueryHandler(confirm, pattern="^confirm_")],
         },
         fallbacks=[CommandHandler("cancel", cancel)],

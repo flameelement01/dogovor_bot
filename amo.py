@@ -16,16 +16,17 @@ F_DATE_TO       = 89203
 F_BRANCH        = 871521
 F_IP            = 910977
 F_COURSE        = 89095
-# Fields to add in AmoCRM later:
-F_MONTH_AMOUNT  = None
-F_DISC_AMOUNT   = None
-F_CONTRACT_TYPE = None
-F_PARENT_DOC_NUM  = None
-F_PARENT_DOC_DATE = None
+F_CLASS         = 96029   # Класс обучения — determines contract_type
+F_MONTH_AMOUNT  = 899103  # Месяц по договору
 
 # Contact custom field IDs
-FC_PARENT_IIN = 898217
-FC_PHONE      = 83341
+FC_PARENT_IIN     = 898217
+FC_PHONE          = 83341
+FC_PARENT_DOC_NUM = 914013  # Номер удостоверения
+FC_PARENT_DOC_DATE = 914015  # Дата выдачи удостоверения (date → unix ts)
+
+# Classes that trigger "graduate" contract type
+GRADUATE_CLASSES = {'5', '10', '11', '12'}
 
 # AmoCRM branch name → contract address
 BRANCH_MAP = {
@@ -154,6 +155,17 @@ def fetch_deal(deal_id):
     ip_raw_list = _field_values_list(cfv, F_IP)
     course_list = _field_values_list(cfv, F_COURSE)
 
+    # Contract type from class number
+    class_val = str(_field_value(cfv, F_CLASS) or '')
+    contract_type = 'graduate' if class_val in GRADUATE_CLASSES else 'regular'
+
+    # "Бюджет" (deal.price) = сумма со скидкой
+    price = lead.get('price')
+    discount_amount = str(price) if price else None
+
+    month_raw = _field_value(cfv, F_MONTH_AMOUNT)
+    month_amount = str(month_raw).replace(' ', '').replace(',', '') if month_raw else None
+
     data = {
         'contract_num':   _field_value(cfv, F_CONTRACT_NUM),
         'child_iin':      _field_value(cfv, F_CHILD_IIN),
@@ -161,15 +173,11 @@ def fetch_deal(deal_id):
         'date_from':      _ts_to_date(_field_value(cfv, F_DATE_FROM)),
         'date_to':        _ts_to_date(_field_value(cfv, F_DATE_TO)),
         'branch':         _map_branch(branch_raw),
-        'total_amount':   str(lead.get('price') or '') or None,
         'ip':             _map_ip(ip_raw_list),
         'course':         _map_course(course_list),
-        # fields not yet in AmoCRM — will be filled manually
-        'month_amount':   _field_value(cfv, F_MONTH_AMOUNT),
-        'discount_amount': _field_value(cfv, F_DISC_AMOUNT),
-        'contract_type':  _field_value(cfv, F_CONTRACT_TYPE),
-        'parent_doc_num':  _field_value(cfv, F_PARENT_DOC_NUM),
-        'parent_doc_date': _field_value(cfv, F_PARENT_DOC_DATE),
+        'contract_type':  contract_type,
+        'month_amount':   month_amount,
+        'discount_amount': discount_amount,
     }
 
     # Fetch contact for parent data
@@ -187,6 +195,8 @@ def fetch_deal(deal_id):
                 data['parent_fio'] = contact.get('name')
                 data['parent_iin'] = _field_value(ccfv, FC_PARENT_IIN)
                 data['parent_phone'] = _field_value(ccfv, FC_PHONE)
+                data['parent_doc_num'] = str(_field_value(ccfv, FC_PARENT_DOC_NUM) or '') or None
+                data['parent_doc_date'] = _ts_to_date(_field_value(ccfv, FC_PARENT_DOC_DATE))
         except Exception:
             pass
 
