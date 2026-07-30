@@ -167,7 +167,7 @@ def fetch_deal(deal_id):
     month_amount = str(month_raw).replace(' ', '').replace(',', '') if month_raw else None
 
     data = {
-        'contract_num':   _field_value(cfv, F_CONTRACT_NUM),
+        'contract_num':   str(deal_id),
         'child_iin':      _field_value(cfv, F_CHILD_IIN),
         'child_fio':      child_fio,
         'date_from':      _ts_to_date(_field_value(cfv, F_DATE_FROM)),

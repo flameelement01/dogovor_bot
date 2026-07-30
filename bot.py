@@ -2,7 +2,7 @@ import os
 import re
 import logging
 from io import BytesIO
-from datetime import date
+from datetime import date, datetime
 
 # Load .env file if BOT_TOKEN not set in environment
 if not os.getenv("BOT_TOKEN"):
@@ -53,10 +53,9 @@ IP_DATA = {
     SELECT_IP,
     ENTER_PARENT_DOC_NUM,
     ENTER_PARENT_DOC_DATE,
-    ENTER_TOTAL_AMOUNT,
     ENTER_MONTH_AMOUNT,
     CONFIRM,
-) = range(7)
+) = range(6)
 
 
 # ==================== HELPERS ====================
@@ -126,6 +125,19 @@ def fmt_amount(val):
         return str(val)
 
 
+def calc_total(month_amount, date_from, date_to):
+    """Calculate total = month_amount × number of calendar months."""
+    try:
+        d_from = datetime.strptime(date_from, '%d.%m.%Y')
+        d_to = datetime.strptime(date_to, '%d.%m.%Y')
+        months = (d_to.year - d_from.year) * 12 + (d_to.month - d_from.month)
+        if months < 1:
+            months = 1
+        return str(int(str(month_amount).replace(' ', '').replace(',', '')) * months)
+    except Exception:
+        return None
+
+
 # ==================== STEP ROUTER ====================
 
 async def _next_step(msg, context):
@@ -153,15 +165,6 @@ async def _next_step(msg, context):
             parse_mode='Markdown'
         )
         return ENTER_PARENT_DOC_DATE
-
-    if not d.get('total_amount'):
-        disc = d.get('discount_amount', '')
-        hint = f"\n\n_(Сумма со скидкой из AMO: {fmt_amount(disc)})_" if disc else ""
-        await msg.reply_text(
-            f"💰 Введите *общую сумму договора* (без скидки, только цифры):{hint}",
-            parse_mode='Markdown'
-        )
-        return ENTER_TOTAL_AMOUNT
 
     if not d.get('month_amount'):
         await msg.reply_text("📆 Введите *сумму в месяц* (только цифры):", parse_mode='Markdown')
@@ -198,6 +201,12 @@ async def enter_deal_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Populate user_data with all fetched values (including None-valued ones)
     context.user_data.update(data)
     context.user_data['contract_date'] = date.today().strftime('%d.%m.%Y')
+
+    # Auto-calculate total if month amount and dates are already known
+    if data.get('month_amount') and data.get('date_from') and data.get('date_to'):
+        total = calc_total(data['month_amount'], data['date_from'], data['date_to'])
+        if total:
+            context.user_data['total_amount'] = total
 
     # Build summary of what was fetched
     d = context.user_data
@@ -248,21 +257,16 @@ async def enter_parent_doc_date(update: Update, context: ContextTypes.DEFAULT_TY
     return await _next_step(update.message, context)
 
 
-async def enter_total_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    val = update.message.text.strip().replace(' ', '').replace(',', '')
-    if not val.isdigit():
-        await update.message.reply_text("⚠️ Введите только цифры!\n\nПример: 1066500")
-        return ENTER_TOTAL_AMOUNT
-    context.user_data['total_amount'] = val
-    return await _next_step(update.message, context)
-
-
 async def enter_month_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     val = update.message.text.strip().replace(' ', '').replace(',', '')
     if not val.isdigit():
         await update.message.reply_text("⚠️ Введите только цифры!\n\nПример: 124000")
         return ENTER_MONTH_AMOUNT
     context.user_data['month_amount'] = val
+    d = context.user_data
+    total = calc_total(val, d.get('date_from', ''), d.get('date_to', ''))
+    if total:
+        context.user_data['total_amount'] = total
     return await _next_step(update.message, context)
 
 
@@ -340,7 +344,6 @@ def main():
             SELECT_IP: [CallbackQueryHandler(select_ip, pattern="^ip_")],
             ENTER_PARENT_DOC_NUM: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_parent_doc_num)],
             ENTER_PARENT_DOC_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_parent_doc_date)],
-            ENTER_TOTAL_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_total_amount)],
             ENTER_MONTH_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_month_amount)],
             CONFIRM: [CallbackQueryHandler(confirm, pattern="^confirm_")],
         },
