@@ -132,12 +132,12 @@ async def amo_webhook(request: Request):
     child  = data.get('child_fio')  or ''
     ct     = 'Выпускной (5/10/11/12)' if data.get('contract_type') == 'graduate' else 'Обычный'
     amo.add_note(deal_id,
-        f"✅ Договор сгенерирован {data['contract_date']}\n"
+        f"✅ Данные для договора проверены {data['contract_date']}\n"
         f"Тип: {ct}\n"
         f"Клиент: {parent} / {child}\n"
         f"Период: {data.get('date_from','')} — {data.get('date_to','')}\n"
         f"Сумма: {data.get('total_amount','')} тг | Месяц: {data.get('month_amount','')} тг\n"
-        f"Файл: Договор_{deal_id}_{parent.split()[0] if parent else ''}.docx"
+        f"📄 Получить файл .docx: боте @shymdogovor_bot → /start → {deal_id}"
     )
 
     return Response("ok", status_code=200)
