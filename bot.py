@@ -4,16 +4,19 @@ import logging
 from io import BytesIO
 from datetime import date
 
-from ocr import extract_from_pdfs
-from contract_generator import generate_contract as generate_from_template
+# Load .env file if BOT_TOKEN not set in environment
+if not os.getenv("BOT_TOKEN"):
+    env_path = os.path.join(os.path.dirname(__file__), ".env")
+    if os.path.exists(env_path):
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    os.environ[k.strip()] = v.strip()
 
-import fitz
-from docx import Document
-from docx.shared import Pt, Cm
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.enum.table import WD_TABLE_ALIGNMENT
-from docx.oxml.ns import qn
-from docx.oxml import OxmlElement
+from contract_generator import generate_contract as generate_from_template
+import amo
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
@@ -46,32 +49,23 @@ IP_DATA = {
 }
 
 (
-    SELECT_IP, SELECT_CONTRACT_TYPE, UPLOAD_PARENT_PDF, UPLOAD_CHILD_PDF,
-    ENTER_CONTRACT_NUM, SELECT_COURSE, ENTER_COURSE_CUSTOM,
-    ENTER_DATE_FROM, ENTER_DATE_TO, SELECT_BRANCH,
-    ENTER_TOTAL_AMOUNT, ENTER_MONTH_AMOUNT, ENTER_DISCOUNT_AMOUNT,
+    ENTER_DEAL_ID,
+    SELECT_IP,
+    SELECT_CONTRACT_TYPE,
+    ENTER_PARENT_DOC_NUM,
+    ENTER_PARENT_DOC_DATE,
+    ENTER_MONTH_AMOUNT,
+    ENTER_DISCOUNT_AMOUNT,
     CONFIRM,
-) = range(14)
+) = range(8)
 
-COURSES = {
-    "course_top": "ТОП школы (НИШ, БИЛ, РФМШ)",
-    "course_ent": "ЕНТ",
-    "course_level": "Повышение уровня знаний",
-    "course_ind": "Индивидуальные уроки",
-}
-
-BRANCHES = {
-    "branch_kunaeva": "пр. Кунаева 95/1",
-    "branch_zheltoksana": "ул. Желтоксана 35",
-    "branch_shayakhmetova": "ул. Шаяхметова 39",
-}
 
 # ==================== HELPERS ====================
 
 def number_to_words(n):
     try:
         n = int(n)
-    except:
+    except Exception:
         return str(n)
     if n == 0:
         return "Ноль"
@@ -129,98 +123,116 @@ def fmt_amount(val):
     try:
         n = int(str(val).replace(' ','').replace(',',''))
         return f"{n:,}".replace(",", " ") + f" ({number_to_words(n)}) тенге"
-    except:
+    except Exception:
         return str(val)
 
 
-def parse_date(s):
-    months = ['января','февраля','марта','апреля','мая','июня',
-              'июля','августа','сентября','октября','ноября','декабря']
-    m = re.match(r'(\d{1,2})[./](\d{1,2})[./](\d{4})', str(s))
-    if m:
-        d, mo, y = m.groups()
-        return int(d), months[int(mo)-1], y
-    return None, s, ''
+# ==================== STEP ROUTER ====================
 
+async def _next_step(msg, context):
+    """Check what's still missing and route to the appropriate next state."""
+    d = context.user_data
 
-def fmt_period(s):
-    d, mn, y = parse_date(s)
-    return f"«{d:02d}» {mn} {y}" if d else s
+    if not d.get('ip'):
+        keyboard = [
+            [InlineKeyboardButton("ИП «Махсутов»", callback_data="ip_mahsutov")],
+            [InlineKeyboardButton("ИП «Білім Орталығы»", callback_data="ip_bilim")],
+        ]
+        await msg.reply_text(
+            "⚠️ ИП не определён в AmoCRM. Выберите вручную:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return SELECT_IP
 
+    if not d.get('parent_doc_num'):
+        await msg.reply_text("📋 Введите *номер удостоверения родителя*:", parse_mode='Markdown')
+        return ENTER_PARENT_DOC_NUM
 
-def fmt_date_str(s):
-    d, mn, y = parse_date(s)
-    return f"«{d}» {mn} {y} г." if d else s
+    if not d.get('parent_doc_date'):
+        await msg.reply_text(
+            "📅 Введите *дату выдачи удостоверения* родителя (ДД.ММ.ГГГГ):\n\nПример: 15.03.2018",
+            parse_mode='Markdown'
+        )
+        return ENTER_PARENT_DOC_DATE
 
+    if not d.get('month_amount'):
+        await msg.reply_text("💰 Введите *сумму в месяц* (только цифры):", parse_mode='Markdown')
+        return ENTER_MONTH_AMOUNT
 
-def fmt_date_short(s):
-    m = re.match(r'(\d{1,2})[./](\d{1,2})[./](\d{4})', str(s))
-    if m:
-        d, mo, y = m.groups()
-        return f"{int(d):02d}.{int(mo):02d}.{y}"
-    return s
+    if d.get('discount_amount') is None:
+        await msg.reply_text(
+            "🎁 Введите *сумму со скидкой* (цифры или *нет* если без акции):",
+            parse_mode='Markdown'
+        )
+        return ENTER_DISCOUNT_AMOUNT
 
+    if not d.get('contract_type'):
+        keyboard = [
+            [InlineKeyboardButton("Обычный договор", callback_data="type_regular")],
+            [InlineKeyboardButton("Для выпускных классов (6/11 класс)", callback_data="type_graduate")],
+        ]
+        await msg.reply_text(
+            "📋 Выберите *тип договора*:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+        return SELECT_CONTRACT_TYPE
 
-# ==================== DOCX ====================
-
-def set_font(run, size=12, bold=False, underline=False, italic=False):
-    run.font.name = 'Times New Roman'
-    run.font.size = Pt(size)
-    run.font.bold = bold
-    run.font.underline = underline
-    run.font.italic = italic
-    rPr = run._r.get_or_add_rPr()
-    rFonts = OxmlElement('w:rFonts')
-    rFonts.set(qn('w:ascii'), 'Times New Roman')
-    rFonts.set(qn('w:hAnsi'), 'Times New Roman')
-    rFonts.set(qn('w:cs'), 'Times New Roman')
-    rPr.insert(0, rFonts)
-
-
-def para(doc, parts, align=WD_ALIGN_PARAGRAPH.JUSTIFY, indent=True, space_after=6, indent_cm=1.25):
-    p = doc.add_paragraph()
-    p.alignment = align
-    p.paragraph_format.space_after = Pt(space_after)
-    p.paragraph_format.line_spacing = Pt(14)
-    if indent:
-        p.paragraph_format.first_line_indent = Cm(indent_cm)
-    if isinstance(parts, str):
-        parts = [(parts, False, False)]
-    for item in parts:
-        if len(item) == 2:
-            text, bold = item
-            ul = False
-        else:
-            text, bold, ul = item
-        r = p.add_run(text)
-        set_font(r, bold=bold, underline=ul)
-    return p
-
-
-def add_tbl_cell(cell, lines):
-    cell.paragraphs[0].clear()
-    for i, (txt, bold) in enumerate(lines):
-        p = cell.paragraphs[0] if i == 0 else cell.add_paragraph()
-        p.paragraph_format.space_after = Pt(3)
-        r = p.add_run(txt)
-        set_font(r, bold=bold)
-
+    return await show_confirm(msg, context)
 
 
 # ==================== HANDLERS ====================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    keyboard = [
-        [InlineKeyboardButton("ИП «Махсутов»", callback_data="ip_mahsutov")],
-        [InlineKeyboardButton("ИП «Білім Орталығы»", callback_data="ip_bilim")],
-    ]
     await update.message.reply_text(
-        "👋 *Генератор договоров AIPLUS*\n\nВыберите ИП для договора:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        "👋 *Генератор договоров AIPLUS*\n\n"
+        "Введите *номер сделки* из AmoCRM:",
         parse_mode='Markdown'
     )
-    return SELECT_IP
+    return ENTER_DEAL_ID
+
+
+async def enter_deal_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if not text.isdigit():
+        await update.message.reply_text("⚠️ Введите числовой ID сделки из AmoCRM.")
+        return ENTER_DEAL_ID
+
+    await update.message.reply_text("⏳ Загружаю данные из AmoCRM...")
+
+    data, error = amo.fetch_deal(int(text))
+    if error:
+        await update.message.reply_text(f"❌ {error}\n\nПопробуйте другой номер или введите /cancel")
+        return ENTER_DEAL_ID
+
+    # Populate user_data with what was found
+    context.user_data.update({k: v for k, v in data.items() if v is not None})
+    context.user_data['contract_date'] = date.today().strftime('%d.%m.%Y')
+    # discount_amount stays None until the step, so we track explicitly
+    if 'discount_amount' not in context.user_data:
+        context.user_data['discount_amount'] = None
+
+    # Build summary of what was fetched
+    d = context.user_data
+    ip_label = IP_DATA.get(d.get('ip', ''), {}).get('label', '❌ не определён')
+    lines = [
+        "✅ *Данные из AmoCRM:*\n",
+        f"🏢 ИП: {ip_label}",
+        f"📄 Договор №: {d.get('contract_num') or '—'}",
+        f"📚 Курс: {d.get('course') or '—'}",
+        f"🗓 Период: {d.get('date_from') or '—'} — {d.get('date_to') or '—'}",
+        f"🏢 Филиал: {d.get('branch') or '—'}",
+        f"💰 Сумма: {fmt_amount(d['total_amount']) if d.get('total_amount') else '—'}",
+        f"\n👤 Родитель: {d.get('parent_fio') or '—'}",
+        f"🪪 ИИН: {d.get('parent_iin') or '—'}",
+        f"📞 Тел: {d.get('parent_phone') or '—'}",
+        f"\n👧 Ребёнок: {d.get('child_fio') or '—'}",
+        f"🪪 ИИН: {d.get('child_iin') or '—'}",
+    ]
+    await update.message.reply_text('\n'.join(lines), parse_mode='Markdown')
+
+    return await _next_step(update.message, context)
 
 
 async def select_ip(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -229,16 +241,8 @@ async def select_ip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ip_key = query.data.replace("ip_", "")
     context.user_data['ip'] = ip_key
     ip = IP_DATA[ip_key]
-    keyboard = [
-        [InlineKeyboardButton("Обычный договор", callback_data="type_regular")],
-        [InlineKeyboardButton("Для выпускных классов (6/11 класс)", callback_data="type_graduate")],
-    ]
-    await query.edit_message_text(
-        f"✅ Выбрано: *{ip['label']}*\n\n📋 Выберите *тип договора*:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode='Markdown'
-    )
-    return SELECT_CONTRACT_TYPE
+    await query.edit_message_text(f"✅ Выбрано: *{ip['label']}*", parse_mode='Markdown')
+    return await _next_step(query.message, context)
 
 
 async def select_contract_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -247,208 +251,55 @@ async def select_contract_type(update: Update, context: ContextTypes.DEFAULT_TYP
     contract_type = 'graduate' if query.data == 'type_graduate' else 'regular'
     context.user_data['contract_type'] = contract_type
     label = 'Для выпускных классов (6/11 класс)' if contract_type == 'graduate' else 'Обычный'
-    await query.edit_message_text(
-        f"✅ Тип: *{label}*\n\n📄 Отправьте PDF или фото *удостоверения личности родителя*",
-        parse_mode='Markdown'
-    )
-    return UPLOAD_PARENT_PDF
+    await query.edit_message_text(f"✅ Тип: *{label}*", parse_mode='Markdown')
+    return await _next_step(query.message, context)
 
 
-async def upload_parent_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.photo:
-        file = await update.message.photo[-1].get_file()
-        context.user_data['parent_pdf'] = bytes(await file.download_as_bytearray())
-    elif update.message.document:
-        file = await update.message.document.get_file()
-        context.user_data['parent_pdf'] = bytes(await file.download_as_bytearray())
-    else:
-        await update.message.reply_text("⚠️ Отправьте PDF или фото удостоверения личности родителя.")
-        return UPLOAD_PARENT_PDF
-    await update.message.reply_text(
-        "✅ Получено!\n\n📄 Теперь отправьте PDF или фото *документа ребёнка* (свидетельство о рождении или удостоверение).",
-        parse_mode='Markdown'
-    )
-    return UPLOAD_CHILD_PDF
+async def enter_parent_doc_num(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['parent_doc_num'] = update.message.text.strip()
+    return await _next_step(update.message, context)
 
 
-async def upload_child_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.photo:
-        file = await update.message.photo[-1].get_file()
-        context.user_data['child_pdf'] = bytes(await file.download_as_bytearray())
-    elif update.message.document:
-        file = await update.message.document.get_file()
-        context.user_data['child_pdf'] = bytes(await file.download_as_bytearray())
-    else:
-        await update.message.reply_text("⚠️ Отправьте PDF или фото документа ребёнка.")
-        return UPLOAD_CHILD_PDF
-
-    await update.message.reply_text("⏳ Читаю документы...")
-
-    extracted = extract_from_pdfs(
-        context.user_data['parent_pdf'],
-        context.user_data['child_pdf'],
-        os.getenv("GOOGLE_VISION_KEY", "")
-    )
-    context.user_data.update(extracted)
-
-    found = [k for k in ['parent_fio','parent_iin','parent_doc_num','child_fio','child_iin'] if extracted.get(k)]
-    if found:
-        msg = (
-            f"✅ *Извлечено из документов:*\n\n"
-            f"👤 Родитель: {extracted.get('parent_fio', '—')}\n"
-            f"🪪 ИИН: {extracted.get('parent_iin', '—')}\n"
-            f"📋 УД №: {extracted.get('parent_doc_num', '—')}\n"
-            f"📅 Дата выдачи: {extracted.get('parent_doc_date', '—')}\n\n"
-            f"👧 Ребёнок: {extracted.get('child_fio', '—')}\n"
-            f"🪪 ИИН: {extracted.get('child_iin', '—')}\n\n"
-            f"⚠️ Проверьте данные — при необходимости исправите в конце."
-        )
-    else:
-        msg = "⚠️ Не удалось извлечь данные автоматически — заполним вручную."
-
-    await update.message.reply_text(msg, parse_mode='Markdown')
-    await update.message.reply_text("📝 Введите *номер договора* (из AmoCRM):", parse_mode='Markdown')
-    return ENTER_CONTRACT_NUM
-
-
-async def enter_contract_num(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['contract_num'] = update.message.text.strip()
-    today = date.today().strftime('%d.%m.%Y')
-    context.user_data['contract_date'] = today
-
-    keyboard = [
-        [InlineKeyboardButton("ТОП школы (НИШ, БИЛ, РФМШ)", callback_data="course_top")],
-        [InlineKeyboardButton("ЕНТ", callback_data="course_ent")],
-        [InlineKeyboardButton("Повышение уровня знаний", callback_data="course_level")],
-        [InlineKeyboardButton("Индивидуальные уроки", callback_data="course_ind")],
-        [InlineKeyboardButton("✏️ Ввести вручную", callback_data="course_custom")],
-    ]
-    await update.message.reply_text(
-        f"✅ Дата договора: *{today}* (сегодня)\n\n📚 Выберите *курс обучения*:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode='Markdown'
-    )
-    return SELECT_COURSE
-
-
-async def select_course(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.data == 'course_custom':
-        await query.edit_message_text("✏️ Введите название курса вручную:")
-        return ENTER_COURSE_CUSTOM
-    context.user_data['course'] = COURSES[query.data]
-    await query.edit_message_text(
-        f"✅ Курс: *{COURSES[query.data]}*\n\n📅 Введите *дату начала* обучения (ДД.ММ.ГГГГ):",
-        parse_mode='Markdown'
-    )
-    return ENTER_DATE_FROM
-
-
-async def enter_course_custom(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['course'] = update.message.text.strip()
-    await update.message.reply_text("📅 Введите *дату начала* обучения (ДД.ММ.ГГГГ):", parse_mode='Markdown')
-    return ENTER_DATE_FROM
-
-
-async def enter_date_from(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def enter_parent_doc_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     val = update.message.text.strip()
     if not re.match(r'^\d{2}\.\d{2}\.\d{4}$', val):
         await update.message.reply_text(
-            "⚠️ Неверный формат! Введите дату в формате *ДД.ММ.ГГГГ*\n\nПример: 01.06.2026",
+            "⚠️ Неверный формат! Введите дату в формате *ДД.ММ.ГГГГ*\n\nПример: 15.03.2018",
             parse_mode='Markdown'
         )
-        return ENTER_DATE_FROM
-    context.user_data['date_from'] = val
-    await update.message.reply_text("📅 Введите *дату окончания* обучения (ДД.ММ.ГГГГ):", parse_mode='Markdown')
-    return ENTER_DATE_TO
-
-
-async def enter_date_to(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    val = update.message.text.strip()
-    if not re.match(r'^\d{2}\.\d{2}\.\d{4}$', val):
-        await update.message.reply_text(
-            "⚠️ Неверный формат! Введите дату в формате *ДД.ММ.ГГГГ*\n\nПример: 01.04.2027",
-            parse_mode='Markdown'
-        )
-        return ENTER_DATE_TO
-    context.user_data['date_to'] = val
-    keyboard = [
-        [InlineKeyboardButton("пр. Кунаева 95/1", callback_data="branch_kunaeva")],
-        [InlineKeyboardButton("ул. Желтоксана 35", callback_data="branch_zheltoksana")],
-        [InlineKeyboardButton("ул. Шаяхметова 39", callback_data="branch_shayakhmetova")],
-    ]
-    await update.message.reply_text(
-        "🏢 Выберите *филиал*:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode='Markdown'
-    )
-    return SELECT_BRANCH
-
-
-async def select_branch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    context.user_data['branch'] = BRANCHES[query.data]
-    await query.edit_message_text(
-        f"✅ Филиал: *{BRANCHES[query.data]}*\n\n💰 Введите *общую сумму* договора (только цифры):",
-        parse_mode='Markdown'
-    )
-    return ENTER_TOTAL_AMOUNT
-
-
-async def enter_total_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    val = update.message.text.strip().replace(' ', '').replace(',', '')
-    if not val.isdigit():
-        await update.message.reply_text(
-            "⚠️ Введите только цифры!\n\nПример: 1066500",
-            parse_mode='Markdown'
-        )
-        return ENTER_TOTAL_AMOUNT
-    context.user_data['total_amount'] = val
-    await update.message.reply_text(
-        f"✅ {fmt_amount(val)}\n\n💰 Введите *сумму за месяц* (только цифры):",
-        parse_mode='Markdown'
-    )
-    return ENTER_MONTH_AMOUNT
+        return ENTER_PARENT_DOC_DATE
+    context.user_data['parent_doc_date'] = val
+    return await _next_step(update.message, context)
 
 
 async def enter_month_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     val = update.message.text.strip().replace(' ', '').replace(',', '')
     if not val.isdigit():
-        await update.message.reply_text(
-            "⚠️ Введите только цифры!\n\nПример: 124000",
-            parse_mode='Markdown'
-        )
+        await update.message.reply_text("⚠️ Введите только цифры!\n\nПример: 124000")
         return ENTER_MONTH_AMOUNT
     context.user_data['month_amount'] = val
-    await update.message.reply_text(
-        f"✅ {fmt_amount(val)}\n\n🎁 Введите *сумму со скидкой* (цифры или *нет* если без акции):",
-        parse_mode='Markdown'
-    )
-    return ENTER_DISCOUNT_AMOUNT
+    return await _next_step(update.message, context)
 
 
 async def enter_discount_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     val = update.message.text.strip()
-    context.user_data['discount_amount'] = '' if val.lower() in ('нет','no','-','0') else val.replace(' ','').replace(',','')
-    context.user_data['schedule'] = []
-    return await show_confirm(update.message, context)
+    context.user_data['discount_amount'] = '' if val.lower() in ('нет', 'no', '-', '0') else val.replace(' ', '').replace(',', '')
+    return await _next_step(update.message, context)
 
 
-
-
-
-async def show_confirm(message, context):
+async def show_confirm(msg, context):
     d = context.user_data
-    ip = IP_DATA[d.get('ip', 'mahsutov')]
+    ip = IP_DATA.get(d.get('ip', 'mahsutov'), IP_DATA['mahsutov'])
     disc = d.get('discount_amount', '')
     disc_line = f"\n🎁 Скидка: {fmt_amount(disc)}" if disc else ""
+    ct = d.get('contract_type', 'regular')
+    ct_label = 'Выпускные классы (6/11)' if ct == 'graduate' else 'Обычный'
     summary = (
         f"📋 *Проверьте данные:*\n\n"
         f"🏢 ИП: {ip['label']}\n"
         f"📄 №: {d.get('contract_num','—')}\n"
         f"📅 Дата: {d.get('contract_date','—')}\n"
+        f"📋 Тип: {ct_label}\n"
         f"📚 Курс: {d.get('course','—')}\n"
         f"🗓 Период: {d.get('date_from','—')} — {d.get('date_to','—')}\n"
         f"🏢 Филиал: {d.get('branch','—')}\n\n"
@@ -462,12 +313,11 @@ async def show_confirm(message, context):
         f"📆 В месяц: {fmt_amount(d.get('month_amount','0'))}"
         f"{disc_line}"
     )
-
     keyboard = [
         [InlineKeyboardButton("✅ Генерировать договор", callback_data="confirm_yes")],
         [InlineKeyboardButton("🔄 Начать заново", callback_data="confirm_no")],
     ]
-    await message.reply_text(summary, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    await msg.reply_text(summary, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
     return CONFIRM
 
 
@@ -484,7 +334,7 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         template = os.path.join(os.path.dirname(__file__), f'template_{ip_key}.docx')
         docx_bytes = generate_from_template(context.user_data, template)
         d = context.user_data
-        filename = f"Договор_{d.get('contract_num','бн')}_{d.get('parent_fio','клиент').split()[0]}.docx"
+        filename = f"Договор_{d.get('contract_num','бн')}_{(d.get('parent_fio') or 'клиент').split()[0]}.docx"
         await query.message.reply_document(
             document=BytesIO(docx_bytes),
             filename=filename,
@@ -507,21 +357,11 @@ def main():
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
+            ENTER_DEAL_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_deal_id)],
             SELECT_IP: [CallbackQueryHandler(select_ip, pattern="^ip_")],
             SELECT_CONTRACT_TYPE: [CallbackQueryHandler(select_contract_type, pattern="^type_")],
-            UPLOAD_PARENT_PDF: [
-                MessageHandler(filters.Document.PDF | filters.Document.IMAGE | filters.PHOTO, upload_parent_pdf)
-            ],
-            UPLOAD_CHILD_PDF: [
-                MessageHandler(filters.Document.PDF | filters.Document.IMAGE | filters.PHOTO, upload_child_pdf)
-            ],
-            ENTER_CONTRACT_NUM: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_contract_num)],
-            SELECT_COURSE: [CallbackQueryHandler(select_course, pattern="^course_")],
-            ENTER_COURSE_CUSTOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_course_custom)],
-            ENTER_DATE_FROM: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_date_from)],
-            ENTER_DATE_TO: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_date_to)],
-            SELECT_BRANCH: [CallbackQueryHandler(select_branch, pattern="^branch_")],
-            ENTER_TOTAL_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_total_amount)],
+            ENTER_PARENT_DOC_NUM: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_parent_doc_num)],
+            ENTER_PARENT_DOC_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_parent_doc_date)],
             ENTER_MONTH_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_month_amount)],
             ENTER_DISCOUNT_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_discount_amount)],
             CONFIRM: [CallbackQueryHandler(confirm, pattern="^confirm_")],
