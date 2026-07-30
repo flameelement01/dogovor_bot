@@ -145,9 +145,8 @@ async def amo_webhook(request: Request):
 
 def start_server():
     port = int(os.getenv('PORT', 8080))
-    uvicorn.run(app, host='0.0.0.0', port=port, log_level='warning')
+    uvicorn.run(app, host='0.0.0.0', port=port, log_level='info')
 
 
-def start_in_background():
-    t = threading.Thread(target=start_server, daemon=True)
-    t.start()
+if __name__ == '__main__':
+    start_server()
