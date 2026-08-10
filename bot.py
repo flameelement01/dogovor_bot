@@ -202,11 +202,7 @@ async def enter_deal_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.update(data)
     context.user_data['contract_date'] = date.today().strftime('%d.%m.%Y')
 
-    # Auto-calculate total if month amount and dates are already known
-    if data.get('month_amount') and data.get('date_from') and data.get('date_to'):
-        total = calc_total(data['month_amount'], data['date_from'], data['date_to'])
-        if total:
-            context.user_data['total_amount'] = total
+    # total_amount comes directly from AMO field 914027
 
     # Build summary of what was fetched
     d = context.user_data
@@ -243,7 +239,8 @@ async def select_ip(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def enter_parent_doc_num(update: Update, context: ContextTypes.DEFAULT_TYPE):
     val = update.message.text.strip()
     context.user_data['parent_doc_num'] = val
-    amo.update_contact(context.user_data.get('_contact_id'), doc_num=val)
+    deal_id = int(context.user_data.get('contract_num', 0) or 0)
+    amo.update_deal_contract(deal_id, doc_num=val)
     return await _next_step(update.message, context)
 
 
@@ -256,7 +253,8 @@ async def enter_parent_doc_date(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return ENTER_PARENT_DOC_DATE
     context.user_data['parent_doc_date'] = val
-    amo.update_contact(context.user_data.get('_contact_id'), doc_date_str=val)
+    deal_id = int(context.user_data.get('contract_num', 0) or 0)
+    amo.update_deal_contract(deal_id, doc_date_str=val)
     return await _next_step(update.message, context)
 
 
@@ -267,9 +265,6 @@ async def enter_month_amount(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return ENTER_MONTH_AMOUNT
     context.user_data['month_amount'] = val
     d = context.user_data
-    total = calc_total(val, d.get('date_from', ''), d.get('date_to', ''))
-    if total:
-        context.user_data['total_amount'] = total
     try:
         amo.update_deal_month(int(d.get('contract_num', 0) or 0), val)
     except Exception:
@@ -354,6 +349,17 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+async def my_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    name = update.effective_user.full_name
+    await update.message.reply_text(
+        f"👤 *{name}*\n\n"
+        f"Твой Telegram chat ID:\n`{chat_id}`\n\n"
+        "Отправь этот ID администратору чтобы подключить автоотправку договоров.",
+        parse_mode='Markdown'
+    )
+
+
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
     conv = ConversationHandler(
@@ -369,6 +375,7 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     app.add_handler(conv)
+    app.add_handler(CommandHandler("myid", my_id))
     print("🤖 Бот запущен!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 

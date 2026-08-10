@@ -89,30 +89,28 @@ def parse_date(s):
     return None
 
 
-def is_mahsutov(paras):
-    """Detect template type by run count in P4"""
-    return len(paras[4].runs) > 20
-
-
 def generate_contract(data, template_path):
     doc = Document(template_path)
 
-    num = data.get('contract_num', '')
-    cdate = data.get('contract_date', '')
-    course = data.get('course', '')
-    df = data.get('date_from', '')
-    dt = data.get('date_to', '')
-    branch = data.get('branch', '')
-    total = data.get('total_amount', '')
-    month_amt = data.get('month_amount', '')
-    disc = data.get('discount_amount', '')
-    pfio = data.get('parent_fio', '')
-    piin = data.get('parent_iin', '')
-    pdoc = data.get('parent_doc_num', '')
-    pdoc_date = data.get('parent_doc_date', '')
-    pphone = data.get('parent_phone', '')
-    cfio = data.get('child_fio', '')
-    ciin = data.get('child_iin', '')
+    # Detect template by filename
+    mahsutov = 'mahsutov' in template_path
+
+    num = data.get('contract_num') or ''
+    cdate = data.get('contract_date') or ''
+    course = data.get('course') or ''
+    df = data.get('date_from') or ''
+    dt = data.get('date_to') or ''
+    branch = data.get('branch') or ''
+    total = data.get('total_amount') or ''
+    month_amt = data.get('month_amount') or ''
+    disc = data.get('discount_amount') or ''
+    pfio = data.get('parent_fio') or ''
+    piin = data.get('parent_iin') or ''
+    pdoc = data.get('parent_doc_num') or ''
+    pdoc_date = data.get('parent_doc_date') or ''
+    pphone = data.get('parent_phone') or ''
+    cfio = data.get('child_fio') or ''
+    ciin = data.get('child_iin') or ''
 
     cd = parse_date(cdate)
     dfd = parse_date(df)
@@ -124,37 +122,48 @@ def generate_contract(data, template_path):
     disc_str, disc_words, _ = fmt_num(disc)
 
     paras = doc.paragraphs
-    mahsutov = is_mahsutov(paras)
 
     # === P1: Contract number ===
     p1 = paras[1]
     if len(p1.runs) > 1:
         p1.runs[1].text = num
 
-    # === P2: Date line ===
-    # Both templates: run7='«', run8=blank(day), run9='»', run11=month, run12=year+г
+    # === P2: Contract date ===
+    # Bilim:    day=r[10], month=r[13], year_last=r[15]  (r[14]=' 202' stays)
+    # Mahsutov: day=r[9],  month=r[12], full year in r[13]
     if cd:
         p2 = paras[2]
         r = p2.runs
-        # run7 contains «, run8=day placeholder, run9=», run11=month, run12=year
-        if len(r) > 12:
-            r[8].text = cd['day']
-            r[11].text = cd['month_num']
-            if mahsutov:
-                r[12].text = ' 202'
-                if len(r) > 13: r[13].text = cd['year_last']
-            else:
-                r[12].text = ' ' + cd['year'] + ' г. '
+        if mahsutov:
+            if len(r) > 13:
+                r[9].text  = cd['day']
+                r[12].text = cd['month_num']
+                r[13].text = ' ' + cd['year'] + ' г. '
+        else:
+            if len(r) > 15:
+                r[10].text = cd['day']
+                r[13].text = cd['month_num']
+                r[15].text = cd['year_last']
 
-    # === P4: Parent data — search by content ===
+    # === P4: Parent data ===
+    # Bilim:    pre-filled names at r[15](last)/r[17](first+mid), date at r[25] as DD.MM.YYYY
+    # Mahsutov: '____' placeholder at r[16], ', выдано «' at r[21]
     p4 = paras[4]
     r4 = p4.runs
-    for ri, run in enumerate(r4):
-        t = run.text
-        # FIO placeholder — underscores after citizen text
-        if '____' in t and ri > 5 and 'далее' not in t and 'адресу' not in t and 'МВД' not in t and 'проживающий' not in t:
-            run.text = pfio + ','
-            break
+
+    if not mahsutov:
+        # Positional FIO write (template has pre-filled data, no ____ placeholders)
+        parts = pfio.strip().split()
+        if len(r4) > 17:
+            r4[15].text = parts[0] if parts else pfio
+            r4[16].text = ' '
+            r4[17].text = ' '.join(parts[1:]) if len(parts) > 1 else ''
+    else:
+        for ri, run in enumerate(r4):
+            t = run.text
+            if '____' in t and ri > 5 and 'далее' not in t and 'адресу' not in t and 'МВД' not in t and 'проживающий' not in t:
+                run.text = pfio + ','
+                break
 
     for ri, run in enumerate(r4):
         if '\nИИН' in run.text:
@@ -162,32 +171,52 @@ def generate_contract(data, template_path):
                 r4[ri+1].text = piin + ', '
             break
 
-    for ri, run in enumerate(r4):
-        if 'удостоверение личности №' in run.text:
-            run.text = 'удостоверение личности № ' + pdoc
-            # Clear extra underscore run
-            if ri+1 < len(r4) and '_' in r4[ri+1].text:
-                r4[ri+1].text = ''
-            break
-
-    for ri, run in enumerate(r4):
-        if ', выдано «' in run.text:
-            run.text = ', выдано «'
-            if pdd:
-                if ri+1 < len(r4): r4[ri+1].text = pdd['day'] + '»'
-                if ri+2 < len(r4): r4[ri+2].text = ' ' + pdd['month_num'] + ' 20' + pdd['year'][2:]
-            else:
-                if ri+1 < len(r4): r4[ri+1].text = '»'
-                if ri+2 < len(r4): r4[ri+2].text = ' ____'
-            break
+    if not mahsutov:
+        # Bilim: r[21]=label, r[22]=pre-filled number → overwrite r[22] with pdoc
+        for ri, run in enumerate(r4):
+            if 'удостоверение личности №' in run.text:
+                run.text = 'удостоверение личности № '
+                if ri+1 < len(r4):
+                    r4[ri+1].text = pdoc
+                break
+        # Bilim: r[24]='выдано ', r[25]=pre-filled date as DD.MM.YYYY
+        for ri, run in enumerate(r4):
+            if run.text.strip() == 'выдано':
+                if pdd and ri+1 < len(r4):
+                    r4[ri+1].text = f'{pdd["day"]}.{pdd["month_num"]}.{pdd["year"]}'
+                break
+    else:
+        for ri, run in enumerate(r4):
+            if 'удостоверение личности №' in run.text:
+                run.text = 'удостоверение личности № ' + pdoc
+                if ri+1 < len(r4) and '_' in r4[ri+1].text:
+                    r4[ri+1].text = ''
+                break
+        for ri, run in enumerate(r4):
+            if ', выдано «' in run.text:
+                run.text = ', выдано «'
+                if pdd:
+                    if ri+1 < len(r4): r4[ri+1].text = pdd['day'] + '»'
+                    if ri+2 < len(r4): r4[ri+2].text = ' ' + pdd['month_num'] + ' 20' + pdd['year'][2:]
+                else:
+                    if ri+1 < len(r4): r4[ri+1].text = '»'
+                    if ri+2 < len(r4): r4[ri+2].text = ' ____'
+                break
 
     # === P5: Child data ===
+    # Bilim:    run[0]='Слушатель: ', run[1]=FIO (any value — positional write)
+    # Mahsutov: run[0]='Слушатель',  run[1]=': FIO placeholder', run[2]=','
     p5 = paras[5]
     r5 = p5.runs
-    for ri, run in enumerate(r5):
-        if '____' in run.text and 'Слушатель' not in run.text:
-            run.text = ': ' + cfio + ','
-            break
+    if not mahsutov:
+        # Bilim: FIO is always run[1] regardless of whether template is blank or pre-filled
+        if len(r5) > 1:
+            r5[1].text = cfio
+    else:
+        for ri, run in enumerate(r5):
+            if '____' in run.text and 'Слушатель' not in run.text:
+                run.text = ': ' + cfio
+                break
     for ri, run in enumerate(r5):
         if run.text == 'ИИН ':
             if ri+1 < len(r5):
@@ -200,40 +229,37 @@ def generate_contract(data, template_path):
         p7.runs[2].text = course
 
     # === P8: Period ===
-    # Both: run0=text(no day), run1='» ', run2=month+year, run3=г, run4=по«, run5=day_to, run6='» ', run7=month_to, run8=year_to
+    # Bilim (14 runs):    day=r[1], month=r[3], year_last=r[5], to_day=r[8], to_month=r[10], to_year=r[12]
+    # Mahsutov (10 runs): from_day embedded in r[0], from_month+year=r[2], to_day=r[5], to_month=r[7], to_year=r[8]
     if dfd and dtd:
         p8 = paras[8]
         r8 = p8.runs
-        # Insert from-day into run0 text
-        r8[0].text = f'1.2. Период оказания Услуг по настоящему Договору с «{dfd["day"]}» '
-        r8[1].text = ''
         if mahsutov:
-            r8[2].text = dfd['month_name'] + ' 202'
-            r8[3].text = dfd['year_last']
-            r8[4].text = ' '
-            r8[5].text = 'г. '
-            r8[6].text = 'по «'
-            r8[7].text = dtd['day']
-            r8[8].text = '» '
-            r8[9].text = dtd['month_name'] + ' '
-            r8[10].text = dtd['year'] + ' г.'
-            if len(r8) > 11:
-                r8[11].text = ', если иное не согласовано Сторонами в письменной форме.'
+            if len(r8) > 8:
+                r8[0].text = f'1.2. Период оказания Услуг по настоящему Договору составляет с «{dfd["day"]}'
+                r8[2].text = dfd['month_num'] + ' ' + dfd['year'] + ' '
+                r8[5].text = dtd['day']
+                r8[7].text = dtd['month_num'] + ' '
+                r8[8].text = dtd['year'] + ' г.'
         else:
-            r8[2].text = dfd['month_name'] + ' ' + dfd['year'] + ' '
-            r8[3].text = 'г. '
-            r8[4].text = 'по «'
-            r8[5].text = dtd['day']
-            r8[6].text = '» '
-            r8[7].text = dtd['month_name'] + ' '
-            r8[8].text = dtd['year'] + ' г.'
-            if len(r8) > 9:
-                r8[9].text = ', если иное не согласовано Сторонами в письменной форме.'
+            if len(r8) > 12:
+                r8[1].text  = dfd['day']
+                r8[3].text  = dfd['month_num']
+                r8[5].text  = dfd['year_last']
+                r8[8].text  = dtd['day']
+                r8[10].text = dtd['month_num']
+                r8[12].text = dtd['year'] + ' г.'
 
-    # === P16: Branch 1.6 ===
+    # === P16: Branch ===
+    # Bilim (4 runs):    run[2]=', ', run[3]=address placeholder → set run[3]
+    # Mahsutov (3 runs): run[2]=', филиал: ___.' → replace entirely
     p16 = paras[16]
-    if len(p16.runs) > 2:
-        p16.runs[2].text = ', ' + branch + '.'
+    br16 = p16.runs
+    if len(br16) > 3:
+        br16[2].text = ', '
+        br16[3].text = branch
+    elif len(br16) > 2:
+        br16[2].text = ', ' + branch + '.'
 
     # === TABLE 0: Requisites ===
     tbl0 = doc.tables[0]
@@ -258,35 +284,34 @@ def generate_contract(data, template_path):
     # === TABLE 1: Appendix 1 ===
     tbl1 = doc.tables[1]
 
-    # Row 0: Total amount + dates
+    # Row 0: period dates + total amount
     cell_total = tbl1.rows[0].cells[2]
     cp0 = cell_total.paragraphs
     if dfd and dtd and len(cp0) > 0:
         r = cp0[0].runs
         if mahsutov:
-            # run2=day_from, run3=month_from+202, run4=year_last, run8=day_to, run9=month_to+year
-            if len(r) > 9:
-                r[2].text = dfd['day'] + '» '
-                r[3].text = dfd['month_name'] + ' 202'
-                r[4].text = dfd['year_last']
-                r[8].text = dtd['day'] + '» '
-                r[9].text = dtd['month_name'] + ' ' + dtd['year'] + ' '
-        else:
-            # run2=day_from, run3=month_from+year, run6=day_to, run7=month_to+year
+            # from_day goes into r[2] (between «» of r[1] and r[2]), from_month+year=r[3]
+            # to_day goes into r[6], to_month+year=r[7]
             if len(r) > 7:
-                r[2].text = dfd['day'] + '» '
-                r[3].text = dfd['month_name'] + ' ' + dfd['year'] + ' '
-                r[6].text = dtd['day'] + '» '
-                r[7].text = dtd['month_name'] + ' ' + dtd['year'] + ' '
+                r[2].text = f'{dfd["day"]}» '
+                r[3].text = f'{dfd["month_num"]} {dfd["year"]} '
+                r[6].text = f'{dtd["day"]}» '
+                r[7].text = f'{dtd["month_num"]} {dtd["year"]} '
+        else:
+            # Entire period is one string in r[2]
+            if len(r) > 2:
+                r[2].text = (
+                    f'«{dfd["day"]}» {dfd["month_num"]} {dfd["year"]} г. '
+                    f'по «{dtd["day"]}» {dtd["month_num"]} {dtd["year"]} '
+                )
 
     if total and len(cp0) > 1:
         p1r = cp0[1].runs
         if p1r:
-            p1r[0].text = f'{total_str} ({total_words})'
+            p1r[0].text = f'{total_str} ({total_words}) тенге.'
             for r in p1r[1:]: r.text = ''
 
-    # Row 1: Month amount
-    # run2 = '124 000 (Сто двадцать четыре тысячи) тенге.'
+    # Row 1: Month amount — run[2] holds the value in both templates
     if month_amt:
         cell_month = tbl1.rows[1].cells[2]
         mp = cell_month.paragraphs
@@ -300,7 +325,6 @@ def generate_contract(data, template_path):
     if disc:
         cell_disc = tbl1.rows[2].cells[2]
         dp = cell_disc.paragraphs
-        # P1: total reference, P2: discount amount
         if len(dp) > 2:
             dr1 = dp[1].runs
             if len(dr1) > 2:
@@ -312,40 +336,48 @@ def generate_contract(data, template_path):
                 for r in dr2[1:]: r.text = ''
 
     # Row 4: Branch
+    # Bilim (4 runs): run[2]=', ', run[3]=address → same logic as P16
+    # Mahsutov (3 runs): run[2]=', филиал: ___' → replace with ', branch'
     cell_branch = tbl1.rows[4].cells[2]
     br = cell_branch.paragraphs[0].runs if cell_branch.paragraphs else []
-    if len(br) > 2:
+    if len(br) > 3:
+        br[2].text = ', '
+        br[3].text = branch
+    elif len(br) > 2:
         br[2].text = ', ' + branch
 
-    # Remove пункт 5 (Заморозка) for graduating classes (6/11 grade)
+    # Remove пункт 5 (Заморозка) for graduating classes (5/10/11/12 grade)
     if data.get('contract_type') == 'graduate' and len(tbl1.rows) > 5:
         tr = tbl1.rows[5]._tr
         tr.getparent().remove(tr)
 
-    # === P153: Appendix 1 date ===
+    # === Appendix 1 date line ===
+    # Bilim:    P153 (runs=3) — r[0]='от ', r[1]='«day» month year ', r[2]='года'
+    # Mahsutov: P157 (runs=1) — single run with full date placeholder
     if cd:
-        p153 = paras[153]
-        r153 = p153.runs
-        if len(r153) > 1:
-            r153[0].text = f'от «{cd["day"]}» {cd["month_num"]} 202'
-            r153[1].text = cd['year_last']
-            if len(r153) > 2: r153[2].text = ' года'
-        elif len(r153) == 1:
-            r153[0].text = f'от «{cd["day"]}» {cd["month_num"]} {cd["year"]} года'
+        date_para_idx = 157 if mahsutov else 153
+        city_para_idx = 161 if mahsutov else 157
 
-        # === P157: App1 city+date ===
-        p157 = paras[157]
-        r157 = p157.runs
+        p_date = paras[date_para_idx]
+        r_date = p_date.runs
+        if len(r_date) > 1:
+            r_date[0].text = f'от «{cd["day"]}» {cd["month_num"]} 202'
+            r_date[1].text = cd['year_last']
+            if len(r_date) > 2: r_date[2].text = ' года'
+        elif r_date:
+            r_date[0].text = f'от «{cd["day"]}» {cd["month_num"]} {cd["year"]} года'
+
+        # === Appendix 1 city + date line ===
+        # Bilim P157 (7 runs):    r[4]='«', r[5]='day» month year ', r[6]='года'
+        # Mahsutov P161 (5 runs): r[3]='   «', r[4]='day» month year года'
+        p_city = paras[city_para_idx]
+        r_city = p_city.runs
         if mahsutov:
-            # run3=year_last, run4=' года' — need to add date
-            if len(r157) > 2:
-                r157[2].text = f'   «{cd["day"]}» {cd["month_num"]} 202'
-                if len(r157) > 3: r157[3].text = cd['year_last']
-                if len(r157) > 4: r157[4].text = ' года'
+            if len(r_city) > 4:
+                r_city[4].text = f'{cd["day"]}» {cd["month_num"]} {cd["year"]} года'
         else:
-            # run2 = spaces, append date
-            if len(r157) > 2:
-                r157[2].text = f'   «{cd["day"]}» {cd["month_num"]} {cd["year"]} года'
+            if len(r_city) > 5:
+                r_city[5].text = f'{cd["day"]}» {cd["month_num"]} {cd["year"]} '
 
     buf = BytesIO()
     doc.save(buf)
