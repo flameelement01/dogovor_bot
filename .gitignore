@@ -1,2 +1,12 @@
 .claude/settings.local.json
 .env
+__pycache__/
+*.pyc
+*.session
+*.session-journal
+.DS_Store
+bot.log
+scripts/bot.log
+scripts/cron.log
+scripts/mismatches_log.json
+scripts/erp_students_cache.json

@@ -11,8 +11,10 @@ from urllib.parse import parse_qs
 
 import uvicorn
 from fastapi import FastAPI, Request, Response
+from fastapi.responses import HTMLResponse
 
 import amo
+import dashboard as db
 from contract_generator import generate_contract
 from manager_map import MANAGER_MAP
 
@@ -132,6 +134,44 @@ def _calc_total(month_amount, date_from, date_to):
 @app.get("/health")
 async def health():
     return {"ok": True}
+
+
+@app.get("/form", response_class=HTMLResponse)
+async def form_page():
+    """Manager self-service form: select name → see today's metrics → submit."""
+    return HTMLResponse(content=db.render_form(), status_code=200)
+
+
+@app.get("/meetings", response_class=HTMLResponse)
+async def meetings_page():
+    """Manager meetings view: today/tomorrow meeting tasks from AMO."""
+    return HTMLResponse(content=db.render_meetings(), status_code=200)
+
+
+@app.get("/api/meetings/{uid}")
+async def api_meetings(uid: int, day: str = "today"):
+    """Return meeting tasks list for one manager."""
+    return db.fetch_meetings(uid, day=day)
+
+
+@app.get("/api/stats/{uid}")
+async def api_stats(uid: int, refresh: str = ""):
+    """Return today's stats JSON for one manager (used by the form JS)."""
+    stats = db.get_manager_stats(uid, force=(refresh == "1"))
+    if not stats:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="manager not found")
+    return stats
+
+
+@app.post("/api/submit")
+async def api_submit(request: Request):
+    """Handle manager form submission: write to Sheets + send Telegram to admin."""
+    body    = await request.json()
+    uid     = int(body.get("uid", 0))
+    comment = str(body.get("comment", "")).strip()
+    result  = db.handle_submit(uid, comment)
+    return result
 
 
 @app.post("/amo/webhook")

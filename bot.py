@@ -1,8 +1,12 @@
 import os
 import re
+import sys
 import logging
 from io import BytesIO
 from datetime import date, datetime
+
+# Make scripts/ importable
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "scripts"))
 
 # Load .env file if BOT_TOKEN not set in environment
 if not os.getenv("BOT_TOKEN"):
@@ -17,6 +21,8 @@ if not os.getenv("BOT_TOKEN"):
 
 from contract_generator import generate_contract as generate_from_template
 import amo
+import dashboard as _db
+from manager_map import MANAGER_USERNAMES
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
@@ -360,6 +366,182 @@ async def my_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+ADMIN_CHAT_ID = 603785864
+
+async def otchet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != ADMIN_CHAT_ID:
+        return
+    msg = await update.message.reply_text("⏳ Загружаю данные из AMO и таблицы...")
+    try:
+        from daily_manager_report import build_report
+        text = build_report()
+        await msg.edit_text(text, parse_mode="HTML")
+    except Exception as e:
+        await msg.edit_text(f"❌ Ошибка: {e}")
+
+
+# ── Group search: write child name or phone → bot replies with responsible manager ──
+
+# Group chat ID where the search feature is active (0 = any group)
+GROUP_CHAT_ID    = -1004443498928   # Основная группа (поиск по AMO + приём пересылок)
+FORWARD_FROM_ID  = -1001519321051   # Параллельная группа (только пересылка)
+
+FORWARD_KEYWORDS = [
+    "консультац", "встреч", "пробный", "пробн",
+    "на тест", "тестирован",
+]
+
+
+def _extract_phone(text: str):
+    """Extract first phone number from text. Returns normalized string or None."""
+    all_digits = re.findall(r'\d{10,}', re.sub(r'[\s\-\(\)\+]', '', text))
+    if not all_digits:
+        return None
+    digits = all_digits[0]
+    if len(digits) >= 11 and digits[0] == '8':
+        digits = digits[1:]   # 87477651084 → 7477651084
+    return digits
+
+
+def _extract_name(text: str):
+    """
+    Extract student name from message.
+    Pattern: first capitalized Cyrillic word (surname) + next alphabetic word (name).
+    Handles both 'Фамилия Имя' and 'Фамилия имя' formats.
+    """
+    words = text.split()
+    for i, w in enumerate(words[:-1]):
+        # Surname: starts with uppercase Cyrillic, 4+ chars total
+        if not re.match(r'^[А-ЯЁ][а-яёА-ЯЁ]{3,}$', w):
+            continue
+        next_w = words[i + 1]
+        # Name: any alphabetic Cyrillic word, 3+ chars
+        if re.match(r'^[а-яёА-ЯЁ]{3,}$', next_w):
+            return f"{w} {next_w}"
+    return None
+
+
+def _extract_query(text: str):
+    """
+    Extract a searchable query from any message (multi-line or mixed).
+    Only reacts to phone numbers or proper names (capitalized words).
+    Returns (query_string, type) where type is 'phone' or 'name', or None.
+    """
+    phone = _extract_phone(text)
+    if phone:
+        return phone, 'phone'
+    name = _extract_name(text)
+    if name:
+        return name, 'name'
+    return None, None
+
+
+async def chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reply with the current chat's ID (useful for configuring group search)."""
+    cid = update.effective_chat.id
+    await update.message.reply_text(f"Chat ID: `{cid}`", parse_mode='Markdown')
+
+
+async def parallel_group_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Forward messages from parallel group to main group if they contain student name or phone."""
+    msg = update.message
+    if not msg or not msg.text:
+        return
+    if msg.chat.id != FORWARD_FROM_ID:
+        return
+
+    # Forward only if message has phone AND visit keyword
+    if not _extract_phone(msg.text):
+        return
+    text_lower = msg.text.lower()
+    if not any(kw in text_lower for kw in FORWARD_KEYWORDS):
+        return
+
+    sender = msg.from_user
+    name   = f"{sender.first_name or ''} {sender.last_name or ''}".strip() if sender else "Неизвестно"
+
+    # Search for responsible manager in AMO
+    query, _ = _extract_query(msg.text)
+    responsible_line = ""
+    if query:
+        result = _db.search_responsible(query)
+        if result:
+            uid      = result["uid"]
+            mgr_name = result["manager_name"]
+            username = MANAGER_USERNAMES.get(uid)
+            mention  = username if username else mgr_name
+            src      = result.get("source", "lead")
+            src_icon = "📅" if src == "task" else ("🗓" if src == "date_field" else "📋")
+            responsible_line = f"\n\n{src_icon} Ответственный: {mention}"
+
+    await context.bot.send_message(
+        chat_id=GROUP_CHAT_ID,
+        text=f"📨 Переслано из параллельной группы\n👤 {name}:\n\n{msg.text}{responsible_line}",
+    )
+
+
+async def group_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Search AMO by name/phone written in group, reply with @responsible manager."""
+    msg = update.message
+    logger.info(f"[group_search] RAW update: msg={bool(msg)} chat_id={msg.chat.id if msg else None} type={msg.chat.type if msg else None} text={msg.text[:40] if msg and msg.text else None}")
+    if not msg or not msg.text:
+        return
+    if msg.chat.type not in ("group", "supergroup"):
+        return
+    if GROUP_CHAT_ID and msg.chat.id != GROUP_CHAT_ID:
+        logger.info(f"[group_search] SKIP: chat {msg.chat.id} != GROUP_CHAT_ID {GROUP_CHAT_ID}")
+        return
+    # Ignore bot's own messages
+    if msg.from_user and msg.from_user.is_bot:
+        return
+
+    query, qtype = _extract_query(msg.text)
+    logger.info(f"[group_search] chat={msg.chat.id} text={msg.text!r} query={query!r}")
+    if not query:
+        return
+
+    result = _db.search_responsible(query)
+    logger.info(f"[group_search] result={result}")
+
+    # Fallback: if phone search found nothing, try name from same message
+    if not result and qtype == 'phone':
+        name = _extract_name(msg.text)
+        if name:
+            logger.info(f"[group_search] phone not found, fallback name={name!r}")
+            result = _db.search_responsible(name)
+            logger.info(f"[group_search] fallback result={result}")
+
+    if not result:
+        return
+
+    uid          = result["uid"]
+    mgr_name     = result["manager_name"]
+    username     = MANAGER_USERNAMES.get(uid)
+    mention      = username if username else mgr_name
+    lead_id      = result["lead_id"]
+    lead_url     = f"https://qadam.amocrm.ru/leads/detail/{lead_id}"
+    contact_name = result.get("contact_name") or "—"
+    source       = result.get("source", "lead")
+
+    if source == "task":
+        src_line = "📅 <b>Задача-встреча запланирована</b>"
+    elif source == "date_field":
+        src_line = "🗓 <b>Дата встречи указана</b>"
+    else:
+        stage = result.get("stage_name", "")
+        src_line = f"📋 Этап: <b>{stage}</b>"
+
+    await msg.reply_text(
+        f"ID #{lead_id}\n"
+        f"👤 {contact_name}\n"
+        f"{src_line}\n"
+        f"Ответственный: {mention}\n"
+        f'<a href="{lead_url}">🔗 Открыть сделку</a>',
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+
+
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
     conv = ConversationHandler(
@@ -376,6 +558,19 @@ def main():
     )
     app.add_handler(conv)
     app.add_handler(CommandHandler("myid", my_id))
+    app.add_handler(CommandHandler("chatid", chatid))
+    app.add_handler(CommandHandler("otchet", otchet))
+    # Forward meeting messages from parallel group to main group (group 0)
+    app.add_handler(MessageHandler(
+        filters.TEXT & filters.ChatType.GROUPS & ~filters.COMMAND,
+        parallel_group_forward
+    ), group=0)
+    # AMO search in main group — must be in group 1 so PTB doesn't skip it
+    # when parallel_group_forward runs first in group 0
+    app.add_handler(MessageHandler(
+        filters.TEXT & filters.ChatType.GROUPS & ~filters.COMMAND,
+        group_search
+    ), group=1)
     print("🤖 Бот запущен!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
