@@ -1,6 +1,10 @@
 import os
 import re
+import json
+import uuid
+import base64
 import logging
+import requests as _requests
 from io import BytesIO
 from datetime import date, datetime
 
@@ -56,6 +60,12 @@ IP_DATA = {
     ENTER_MONTH_AMOUNT,
     CONFIRM,
 ) = range(6)
+
+# States for /zapros flow
+REQ_STUDENT, REQ_TEXT, REQ_URGENCY = range(10, 13)
+
+GITHUB_TOKEN = os.getenv('GITHUB_TOKEN', '')
+ASSISTANT_DATA_REPO = 'flameelement01/assistant-data'
 
 
 # ==================== HELPERS ====================
@@ -175,8 +185,69 @@ async def _next_step(msg, context):
 
 # ==================== HANDLERS ====================
 
+def _sync_request_to_github(req_data):
+    """Append a new request to assistant-data/data.json via GitHub API."""
+    if not GITHUB_TOKEN:
+        logger.warning("GITHUB_TOKEN not set — skipping GitHub sync")
+        return False
+    api_url = f'https://api.github.com/repos/{ASSISTANT_DATA_REPO}/contents/data.json'
+    headers = {
+        'Authorization': f'token {GITHUB_TOKEN}',
+        'Accept': 'application/vnd.github.v3+json',
+    }
+    try:
+        r = _requests.get(api_url, headers=headers, timeout=10)
+        if r.status_code == 200:
+            file_info = r.json()
+            sha = file_info['sha']
+            raw = base64.b64decode(file_info['content'].replace('\n', '')).decode('utf-8')
+            data = json.loads(raw)
+        elif r.status_code == 404:
+            data, sha = {}, None
+        else:
+            logger.error(f"GitHub read error {r.status_code}")
+            return False
+
+        data.setdefault('requests', [])
+        data['requests'].append(req_data)
+
+        new_b64 = base64.b64encode(
+            json.dumps(data, ensure_ascii=False, indent=2).encode('utf-8')
+        ).decode('ascii')
+        payload = {
+            'message': f'Add parent request: {req_data.get("student", "?")}',
+            'content': new_b64,
+        }
+        if sha:
+            payload['sha'] = sha
+        r2 = _requests.put(api_url, json=payload, headers=headers, timeout=15)
+        return r2.status_code in (200, 201)
+    except Exception as e:
+        logger.error(f"GitHub sync error: {e}")
+        return False
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
+
+    # Deep-link from /zapros button: /start req_<group_id>
+    args = context.args
+    if args and args[0].startswith('req_'):
+        try:
+            context.user_data['source_group_id'] = int(args[0][4:])
+        except ValueError:
+            pass
+        user = update.effective_user
+        context.user_data['mentor_name'] = user.full_name
+        context.user_data['mentor_username'] = user.username or ''
+        await update.message.reply_text(
+            "📬 *Запрос от родителя*\n\n"
+            "Шаг 1/3 — Введите *имя ученика*\n"
+            "_(Фамилия Имя, например: Иванов Данияр)_",
+            parse_mode='Markdown'
+        )
+        return REQ_STUDENT
+
     await update.message.reply_text(
         "👋 *Генератор договоров AIPLUS*\n\n"
         "Введите *номер сделки* из AmoCRM:",
@@ -354,21 +425,192 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+# ==================== /ZAPROS FLOW ====================
+
+async def zapros_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /zapros in a group — send a deep-link button to private chat."""
+    if update.effective_chat.type == 'private':
+        await update.message.reply_text(
+            "Эту команду используйте в группе *Администрация Шымкент*.\n"
+            "Или нажмите /start для генератора договоров.",
+            parse_mode='Markdown'
+        )
+        return
+
+    group_id = update.effective_chat.id
+    bot_info = await context.bot.get_me()
+    deep_link = f"https://t.me/{bot_info.username}?start=req_{group_id}"
+
+    keyboard = [[InlineKeyboardButton("📝 Заполнить запрос", url=deep_link)]]
+    await update.message.reply_text(
+        "📬 Нажмите кнопку — заполните запрос родителя в личном чате:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def req_student(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Step 1 — receive student name, search AmoCRM."""
+    student_name = update.message.text.strip()
+    context.user_data['student_name'] = student_name
+
+    await update.message.reply_text("⏳ Ищу ученика в AmoCRM...")
+
+    lead_data, error = amo.search_lead_by_student(student_name)
+    if error:
+        context.user_data.update({'lead_id': None, 'responsible_user_id': None, 'manager_name': 'Не определён'})
+        await update.message.reply_text(
+            f"⚠️ {error}\n\nЗапрос всё равно будет создан.\n\n"
+            "Шаг 2/3 — Опишите запрос родителя:"
+        )
+    else:
+        manager_name = amo.get_user_name(lead_data['responsible_user_id']) or 'Не определён'
+        context.user_data.update({
+            'lead_id': lead_data['lead_id'],
+            'responsible_user_id': lead_data['responsible_user_id'],
+            'manager_name': manager_name,
+        })
+        await update.message.reply_text(
+            f"✅ Ученик найден!\n"
+            f"👤 Ответственный менеджер: *{manager_name}*\n\n"
+            "Шаг 2/3 — Опишите запрос родителя:",
+            parse_mode='Markdown'
+        )
+    return REQ_TEXT
+
+
+async def req_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Step 2 — receive request text, ask urgency."""
+    context.user_data['req_text'] = update.message.text.strip()
+    keyboard = [
+        [InlineKeyboardButton("🔴 Срочно (1 день)", callback_data="urg_urgent")],
+        [InlineKeyboardButton("🟢 Обычный (2 дня)", callback_data="urg_normal")],
+    ]
+    await update.message.reply_text(
+        "Шаг 3/3 — Выберите срочность:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return REQ_URGENCY
+
+
+async def req_urgency(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Step 3 — receive urgency, create AMO task, notify group."""
+    query = update.callback_query
+    await query.answer()
+
+    is_urgent = query.data == 'urg_urgent'
+    urgency_label = '🔴 Срочно' if is_urgent else '🟢 Обычный'
+    deadline_days = 1 if is_urgent else 2
+
+    d = context.user_data
+    student_name = d.get('student_name', '—')
+    req_text_val = d.get('req_text', '—')
+    mentor_name = d.get('mentor_name', '—')
+    mentor_username = d.get('mentor_username', '')
+    manager_name = d.get('manager_name', 'Не определён')
+
+    # Create AMO task
+    task_created = False
+    if d.get('lead_id') and d.get('responsible_user_id'):
+        mentor_line = f"{mentor_name}" + (f" (@{mentor_username})" if mentor_username else "")
+        task_text = (
+            f"Запрос от родителя\n"
+            f"Ученик: {student_name}\n"
+            f"Ментор: {mentor_line}\n"
+            f"Запрос: {req_text_val}\n"
+            f"Срочность: {urgency_label}"
+        )
+        task_id, err = amo.create_task(d['lead_id'], d['responsible_user_id'], task_text, deadline_days)
+        task_created = task_id is not None
+        if err:
+            logger.error(f"AMO create_task error: {err}")
+
+    amo_status = "✅ Задача создана в AmoCRM" if task_created else "⚠️ Задача в AmoCRM не создана (ученик не найден)"
+
+    # Sync to assistant-data so dashboard shows it
+    today_str = date.today().strftime('%Y-%m-%d')
+    deadline_str = date.today().replace(day=date.today().day + deadline_days).strftime('%Y-%m-%d') \
+        if False else (date.fromordinal(date.today().toordinal() + deadline_days)).strftime('%Y-%m-%d')
+    req_record = {
+        'id': str(uuid.uuid4()),
+        'student': student_name,
+        'grade': '',
+        'parent': '',
+        'contact': '',
+        'text': req_text_val,
+        'mentor': mentor_name,
+        'deadline': deadline_str,
+        'status': 'new',
+        'source': 'bot',
+        'comment': f'AmoCRM менеджер: {manager_name}',
+        'createdAt': today_str,
+    }
+    github_synced = _sync_request_to_github(req_record)
+
+    # Reply to mentor in private
+    sync_line = "📊 Запрос добавлен в дашборд" if github_synced else ""
+    await query.edit_message_text(
+        f"📬 *Запрос отправлен!*\n\n"
+        f"👧 Ученик: {student_name}\n"
+        f"📝 Запрос: {req_text_val}\n"
+        f"⚡️ Срочность: {urgency_label}\n"
+        f"👤 Менеджер: {manager_name}\n\n"
+        f"{amo_status}\n"
+        f"{sync_line}",
+        parse_mode='Markdown'
+    )
+
+    # Post summary back to group
+    group_id = d.get('source_group_id')
+    if group_id:
+        mentor_tag = f"@{mentor_username}" if mentor_username else mentor_name
+        group_msg = (
+            f"📬 *Новый запрос от родителя*\n\n"
+            f"👧 Ученик: {student_name}\n"
+            f"📝 Запрос: {req_text_val}\n"
+            f"⚡️ Срочность: {urgency_label}\n"
+            f"👤 Менеджер: {manager_name}\n"
+            f"📨 Ментор: {mentor_tag}\n"
+            f"📅 Дата: {today_str}\n\n"
+            f"{amo_status}"
+        )
+        try:
+            await context.bot.send_message(chat_id=group_id, text=group_msg, parse_mode='Markdown')
+        except Exception as e:
+            logger.error(f"Group message error: {e}")
+
+    return ConversationHandler.END
+
+
+async def req_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("❌ Запрос отменён.")
+    return ConversationHandler.END
+
+
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
+
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
+            # Contract generator flow (states 0-5)
             ENTER_DEAL_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_deal_id)],
             SELECT_IP: [CallbackQueryHandler(select_ip, pattern="^ip_")],
             ENTER_PARENT_DOC_NUM: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_parent_doc_num)],
             ENTER_PARENT_DOC_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_parent_doc_date)],
             ENTER_MONTH_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_month_amount)],
             CONFIRM: [CallbackQueryHandler(confirm, pattern="^confirm_")],
+            # Parent request flow (states 10-12)
+            REQ_STUDENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, req_student)],
+            REQ_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, req_text)],
+            REQ_URGENCY: [CallbackQueryHandler(req_urgency, pattern="^urg_")],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[CommandHandler("cancel", cancel), CommandHandler("cancel", req_cancel)],
     )
     app.add_handler(conv)
+
+    # /zapros command in group sends a deep-link button (outside ConversationHandler)
+    app.add_handler(CommandHandler("zapros", zapros_group))
+
     print("🤖 Бот запущен!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 

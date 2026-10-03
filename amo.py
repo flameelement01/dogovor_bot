@@ -262,3 +262,90 @@ def add_note(deal_id, text):
         )
     except Exception:
         pass
+
+
+def search_lead_by_student(name):
+    """Search AmoCRM leads by student name. Returns (dict, error_string)."""
+    if not DOMAIN or not TOKEN:
+        return None, 'AmoCRM не настроен'
+
+    from urllib.parse import quote
+    url = f'https://{DOMAIN}/api/v4/leads?query={quote(name)}&with=custom_fields_values&limit=5'
+    try:
+        r = requests.get(url, headers=_headers(), timeout=10)
+    except Exception as e:
+        return None, f'Ошибка сети: {e}'
+
+    if r.status_code == 204:
+        return None, f'Ученик "{name}" не найден в AmoCRM'
+    if r.status_code != 200:
+        return None, f'AmoCRM ошибка {r.status_code}'
+
+    leads = (r.json().get('_embedded') or {}).get('leads') or []
+    if not leads:
+        return None, f'Ученик "{name}" не найден в AmoCRM'
+
+    # Try to match by student first/last name in custom fields
+    parts = name.lower().split()
+    best = None
+    for lead in leads:
+        cfv = lead.get('custom_fields_values') or []
+        fname = (_field_value(cfv, F_CHILD_FIRST) or '').lower()
+        lname = (_field_value(cfv, F_CHILD_LAST) or '').lower()
+        combined = f'{fname} {lname} {lname} {fname}'
+        if any(p in combined for p in parts):
+            best = lead
+            break
+    if not best:
+        best = leads[0]
+
+    return {
+        'lead_id': best['id'],
+        'lead_name': best.get('name', ''),
+        'responsible_user_id': best.get('responsible_user_id'),
+    }, None
+
+
+def get_user_name(user_id):
+    """Get AmoCRM user display name by ID."""
+    if not DOMAIN or not TOKEN or not user_id:
+        return None
+    try:
+        r = requests.get(
+            f'https://{DOMAIN}/api/v4/users/{user_id}',
+            headers=_headers(), timeout=10
+        )
+        if r.status_code == 200:
+            return r.json().get('name')
+    except Exception:
+        pass
+    return None
+
+
+def create_task(lead_id, responsible_user_id, text, deadline_days=2):
+    """Create a task on a lead in AmoCRM. Returns (task_id, error_string)."""
+    if not DOMAIN or not TOKEN:
+        return None, 'AmoCRM не настроен'
+
+    from datetime import timedelta
+    deadline_ts = int((datetime.now() + timedelta(days=deadline_days)).timestamp())
+
+    try:
+        r = requests.post(
+            f'https://{DOMAIN}/api/v4/tasks',
+            json=[{
+                'entity_id': int(lead_id),
+                'entity_type': 'leads',
+                'responsible_user_id': int(responsible_user_id),
+                'text': text,
+                'complete_till': deadline_ts,
+                'task_type_id': 1,
+            }],
+            headers=_headers(), timeout=10
+        )
+        if r.status_code in (200, 201):
+            tasks = (r.json().get('_embedded') or {}).get('tasks') or []
+            return (tasks[0]['id'] if tasks else True), None
+        return None, f'AmoCRM ошибка {r.status_code}: {r.text[:200]}'
+    except Exception as e:
+        return None, f'Ошибка сети: {e}'
