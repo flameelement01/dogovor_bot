@@ -349,3 +349,29 @@ def create_task(lead_id, responsible_user_id, text, deadline_days=2):
         return None, f'AmoCRM ошибка {r.status_code}: {r.text[:200]}'
     except Exception as e:
         return None, f'Ошибка сети: {e}'
+
+
+def get_overdue_tasks():
+    """Fetch overdue incomplete tasks from AmoCRM. Returns (tasks_list, error)."""
+    if not DOMAIN or not TOKEN:
+        return [], 'AmoCRM не настроен'
+
+    now_ts = int(datetime.now().timestamp())
+    url = (
+        f'https://{DOMAIN}/api/v4/tasks'
+        f'?filter[is_completed]=0'
+        f'&filter[complete_till][to]={now_ts}'
+        f'&limit=50'
+    )
+    try:
+        r = requests.get(url, headers=_headers(), timeout=10)
+    except Exception as e:
+        return [], f'Ошибка сети: {e}'
+
+    if r.status_code == 204:
+        return [], None
+    if r.status_code != 200:
+        return [], f'AmoCRM ошибка {r.status_code}'
+
+    tasks = (r.json().get('_embedded') or {}).get('tasks') or []
+    return tasks, None
