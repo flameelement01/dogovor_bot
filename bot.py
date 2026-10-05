@@ -32,6 +32,8 @@ logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=lo
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN")
+ROP_TELEGRAM_ID = os.getenv("ROP_TELEGRAM_ID", "")
+ADMIN_GROUP_ID = os.getenv("ADMIN_GROUP_ID", "")
 
 IP_DATA = {
     "mahsutov": {
@@ -62,7 +64,7 @@ IP_DATA = {
 ) = range(6)
 
 # States for /zapros flow
-REQ_STUDENT, REQ_TEXT, REQ_URGENCY = range(10, 13)
+REQ_STUDENT, REQ_TEXT, REQ_URGENCY, REQ_CONFIRM_MANAGER, REQ_ENTER_MANAGER = range(10, 15)
 
 GITHUB_TOKEN = os.getenv('GITHUB_TOKEN', '')
 ASSISTANT_DATA_REPO = 'flameelement01/assistant-data'
@@ -438,6 +440,7 @@ async def zapros_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     group_id = update.effective_chat.id
+    context.bot_data['admin_group_id'] = group_id  # remember for daily report
     bot_info = await context.bot.get_me()
     deep_link = f"https://t.me/{bot_info.username}?start=req_{group_id}"
 
@@ -462,19 +465,54 @@ async def req_student(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⚠️ {error}\n\nЗапрос всё равно будет создан.\n\n"
             "Шаг 2/3 — Опишите запрос родителя:"
         )
-    else:
-        manager_name = amo.get_user_name(lead_data['responsible_user_id']) or 'Не определён'
-        context.user_data.update({
-            'lead_id': lead_data['lead_id'],
-            'responsible_user_id': lead_data['responsible_user_id'],
-            'manager_name': manager_name,
-        })
-        await update.message.reply_text(
-            f"✅ Ученик найден!\n"
-            f"👤 Ответственный менеджер: *{manager_name}*\n\n"
+        return REQ_TEXT
+
+    manager_name = amo.get_user_name(lead_data['responsible_user_id']) or 'Не определён'
+    context.user_data.update({
+        'lead_id': lead_data['lead_id'],
+        'responsible_user_id': lead_data['responsible_user_id'],
+        'manager_name': manager_name,
+    })
+    keyboard = [
+        [InlineKeyboardButton(f"✅ Верно — {manager_name}", callback_data="mgr_ok")],
+        [InlineKeyboardButton("🔄 Назначить другого менеджера", callback_data="mgr_change")],
+    ]
+    await update.message.reply_text(
+        f"✅ Ученик найден!\n"
+        f"👤 Ответственный менеджер: *{manager_name}*\n\n"
+        "Это правильный менеджер?",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+    return REQ_CONFIRM_MANAGER
+
+
+async def req_confirm_manager(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Step 1.5 — confirm or change manager (callback)."""
+    query = update.callback_query
+    await query.answer()
+    if query.data == 'mgr_ok':
+        await query.edit_message_text(
+            f"✅ Менеджер: *{context.user_data['manager_name']}*\n\n"
             "Шаг 2/3 — Опишите запрос родителя:",
             parse_mode='Markdown'
         )
+        return REQ_TEXT
+    await query.edit_message_text("Введите имя другого менеджера:")
+    return REQ_ENTER_MANAGER
+
+
+async def req_enter_manager(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Step 1.6 — receive custom manager name."""
+    manager_name = update.message.text.strip()
+    context.user_data['manager_name'] = manager_name
+    context.user_data['responsible_user_id'] = None
+    context.user_data['lead_id'] = None
+    await update.message.reply_text(
+        f"✅ Менеджер назначен: *{manager_name}*\n\n"
+        "Шаг 2/3 — Опишите запрос родителя:",
+        parse_mode='Markdown'
+    )
     return REQ_TEXT
 
 
@@ -578,6 +616,25 @@ async def req_urgency(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"Group message error: {e}")
 
+    # Personal notification to РОП for urgent requests
+    if is_urgent and ROP_TELEGRAM_ID:
+        mentor_tag = f"@{mentor_username}" if mentor_username else mentor_name
+        try:
+            await context.bot.send_message(
+                chat_id=int(ROP_TELEGRAM_ID),
+                text=(
+                    f"🔴 *СРОЧНЫЙ ЗАПРОС*\n\n"
+                    f"👧 Ученик: {student_name}\n"
+                    f"📝 Запрос: {req_text_val}\n"
+                    f"👤 Менеджер: {manager_name}\n"
+                    f"📨 Ментор: {mentor_tag}\n\n"
+                    f"{amo_status}"
+                ),
+                parse_mode='Markdown'
+            )
+        except Exception as e:
+            logger.error(f"ROP notification error: {e}")
+
     return ConversationHandler.END
 
 
@@ -586,7 +643,40 @@ async def req_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+async def send_daily_overdue_report(context: ContextTypes.DEFAULT_TYPE):
+    """Daily job: send overdue AmoCRM tasks report to admin group at 9:00 AM."""
+    group_id = ADMIN_GROUP_ID or context.bot_data.get('admin_group_id', '')
+    if not group_id:
+        logger.warning("ADMIN_GROUP_ID not set — skipping daily overdue report")
+        return
+
+    tasks, error = amo.get_overdue_tasks()
+    if error:
+        logger.error(f"get_overdue_tasks error: {error}")
+        return
+    if not tasks:
+        return  # Nothing overdue — stay silent
+
+    lines = [f"⏰ *Просроченные задачи AmoCRM — {date.today().strftime('%d.%m.%Y')}*\n"]
+    for t in tasks[:20]:
+        text = (t.get('text') or '—')[:80]
+        manager = amo.get_user_name(t.get('responsible_user_id')) or 'Неизвестен'
+        ts = t.get('complete_till')
+        dl = datetime.fromtimestamp(ts).strftime('%d.%m') if ts else '—'
+        lines.append(f"• {text}\n  👤 {manager} | 📅 до {dl}")
+
+    try:
+        await context.bot.send_message(
+            chat_id=int(group_id),
+            text='\n'.join(lines),
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        logger.error(f"Daily report send error: {e}")
+
+
 def main():
+    import datetime as dt
     app = Application.builder().token(BOT_TOKEN).build()
 
     conv = ConversationHandler(
@@ -599,17 +689,24 @@ def main():
             ENTER_PARENT_DOC_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_parent_doc_date)],
             ENTER_MONTH_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_month_amount)],
             CONFIRM: [CallbackQueryHandler(confirm, pattern="^confirm_")],
-            # Parent request flow (states 10-12)
+            # Parent request flow (states 10-14)
             REQ_STUDENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, req_student)],
+            REQ_CONFIRM_MANAGER: [CallbackQueryHandler(req_confirm_manager, pattern="^mgr_")],
+            REQ_ENTER_MANAGER: [MessageHandler(filters.TEXT & ~filters.COMMAND, req_enter_manager)],
             REQ_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, req_text)],
             REQ_URGENCY: [CallbackQueryHandler(req_urgency, pattern="^urg_")],
         },
         fallbacks=[CommandHandler("cancel", cancel), CommandHandler("cancel", req_cancel)],
     )
     app.add_handler(conv)
-
-    # /zapros command in group sends a deep-link button (outside ConversationHandler)
     app.add_handler(CommandHandler("zapros", zapros_group))
+
+    # Daily overdue report at 9:00 AM Almaty time (UTC+5 = 04:00 UTC)
+    app.job_queue.run_daily(
+        send_daily_overdue_report,
+        time=dt.time(hour=4, minute=0, tzinfo=dt.timezone.utc),
+        name='daily_overdue_report',
+    )
 
     print("🤖 Бот запущен!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
