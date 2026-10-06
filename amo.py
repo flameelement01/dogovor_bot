@@ -285,19 +285,21 @@ def search_lead_by_student(name):
     if not leads:
         return None, f'Ученик "{name}" не найден в AmoCRM'
 
-    # Try to match by student first/last name in custom fields
+    # AmoCRM's query= is a loose full-text search, so every part of the typed
+    # name must appear on the lead. Matching on one part alone, or falling back
+    # to the first result, attaches the request to an unrelated student.
     parts = name.lower().split()
     best = None
     for lead in leads:
         cfv = lead.get('custom_fields_values') or []
         fname = (_field_value(cfv, F_CHILD_FIRST) or '').lower()
         lname = (_field_value(cfv, F_CHILD_LAST) or '').lower()
-        combined = f'{fname} {lname} {lname} {fname}'
-        if any(p in combined for p in parts):
+        combined = f"{fname} {lname} {(lead.get('name') or '').lower()}"
+        if parts and all(p in combined for p in parts):
             best = lead
             break
     if not best:
-        best = leads[0]
+        return None, f'Ученик "{name}" не найден в AmoCRM'
 
     return {
         'lead_id': best['id'],

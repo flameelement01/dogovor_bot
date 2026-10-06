@@ -548,6 +548,7 @@ async def req_urgency(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Create AMO task
     task_created = False
+    task_error = None
     if d.get('lead_id') and d.get('responsible_user_id'):
         mentor_line = f"{mentor_name}" + (f" (@{mentor_username})" if mentor_username else "")
         task_text = (
@@ -559,10 +560,16 @@ async def req_urgency(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         task_id, err = amo.create_task(d['lead_id'], d['responsible_user_id'], task_text, deadline_days)
         task_created = task_id is not None
+        task_error = err
         if err:
             logger.error(f"AMO create_task error: {err}")
 
-    amo_status = "✅ Задача создана в AmoCRM" if task_created else "⚠️ Задача в AmoCRM не создана (ученик не найден)"
+    if task_created:
+        amo_status = "✅ Задача создана в AmoCRM"
+    elif task_error:
+        amo_status = f"⚠️ Задача в AmoCRM не создана ({task_error})"
+    else:
+        amo_status = "⚠️ Задача в AmoCRM не создана (ученик не найден в AmoCRM)"
 
     # Sync to assistant-data so dashboard shows it
     today_str = date.today().strftime('%Y-%m-%d')
