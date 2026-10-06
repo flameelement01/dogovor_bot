@@ -1,9 +1,13 @@
 import os
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 DOMAIN = os.getenv('AMOCRM_DOMAIN', '')
 TOKEN = os.getenv('AMOCRM_TOKEN', '')
+
+# Deadlines are judged by the manager's working day, not the server's UTC clock.
+ALMATY_TZ = timezone(timedelta(hours=5))
+WORKDAY_END_HOUR = 18
 
 # Deal custom field IDs
 F_CONTRACT_NUM  = 425865
@@ -324,13 +328,24 @@ def get_user_name(user_id):
     return None
 
 
-def create_task(lead_id, responsible_user_id, text, deadline_days=2):
+def today_deadline(is_urgent):
+    """Deadline for a parent request — always the same working day in Almaty."""
+    now = datetime.now(ALMATY_TZ)
+    target = now + timedelta(hours=2) if is_urgent else now.replace(
+        hour=WORKDAY_END_HOUR, minute=0, second=0, microsecond=0
+    )
+    # Leave a usable window when the request arrives late, without spilling
+    # into tomorrow — a request raised today is a request owed today.
+    target = max(target, now + timedelta(minutes=30))
+    return min(target, now.replace(hour=23, minute=59, second=0, microsecond=0))
+
+
+def create_task(lead_id, responsible_user_id, text, complete_till):
     """Create a task on a lead in AmoCRM. Returns (task_id, error_string)."""
     if not DOMAIN or not TOKEN:
         return None, 'AmoCRM не настроен'
 
-    from datetime import timedelta
-    deadline_ts = int((datetime.now() + timedelta(days=deadline_days)).timestamp())
+    deadline_ts = int(complete_till.timestamp())
 
     try:
         r = requests.post(
@@ -351,6 +366,34 @@ def create_task(lead_id, responsible_user_id, text, deadline_days=2):
         return None, f'AmoCRM ошибка {r.status_code}: {r.text[:200]}'
     except Exception as e:
         return None, f'Ошибка сети: {e}'
+
+
+def get_open_tasks_due_today():
+    """Incomplete tasks whose deadline falls today in Almaty. Returns (list, error)."""
+    if not DOMAIN or not TOKEN:
+        return [], 'AmoCRM не настроен'
+
+    now = datetime.now(ALMATY_TZ)
+    day_start = int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+    day_end = int(now.replace(hour=23, minute=59, second=59, microsecond=0).timestamp())
+    url = (
+        f'https://{DOMAIN}/api/v4/tasks'
+        f'?filter[is_completed]=0'
+        f'&filter[complete_till][from]={day_start}'
+        f'&filter[complete_till][to]={day_end}'
+        f'&limit=50'
+    )
+    try:
+        r = requests.get(url, headers=_headers(), timeout=10)
+    except Exception as e:
+        return [], f'Ошибка сети: {e}'
+
+    if r.status_code == 204:
+        return [], None
+    if r.status_code != 200:
+        return [], f'AmoCRM ошибка {r.status_code}'
+
+    return (r.json().get('_embedded') or {}).get('tasks') or [], None
 
 
 def get_overdue_tasks():

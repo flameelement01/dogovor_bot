@@ -520,8 +520,8 @@ async def req_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Step 2 — receive request text, ask urgency."""
     context.user_data['req_text'] = update.message.text.strip()
     keyboard = [
-        [InlineKeyboardButton("🔴 Срочно (1 день)", callback_data="urg_urgent")],
-        [InlineKeyboardButton("🟢 Обычный (2 дня)", callback_data="urg_normal")],
+        [InlineKeyboardButton("🔴 Срочно (2 часа)", callback_data="urg_urgent")],
+        [InlineKeyboardButton("🟢 Обычный (сегодня до 18:00)", callback_data="urg_normal")],
     ]
     await update.message.reply_text(
         "Шаг 3/3 — Выберите срочность:",
@@ -536,8 +536,11 @@ async def req_urgency(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     is_urgent = query.data == 'urg_urgent'
-    urgency_label = '🔴 Срочно' if is_urgent else '🟢 Обычный'
-    deadline_days = 1 if is_urgent else 2
+    deadline = amo.today_deadline(is_urgent)
+    urgency_label = (
+        f"🔴 Срочно — сегодня до {deadline:%H:%M}" if is_urgent
+        else f"🟢 Обычный — сегодня до {deadline:%H:%M}"
+    )
 
     d = context.user_data
     student_name = d.get('student_name', '—')
@@ -558,7 +561,7 @@ async def req_urgency(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Запрос: {req_text_val}\n"
             f"Срочность: {urgency_label}"
         )
-        task_id, err = amo.create_task(d['lead_id'], d['responsible_user_id'], task_text, deadline_days)
+        task_id, err = amo.create_task(d['lead_id'], d['responsible_user_id'], task_text, deadline)
         task_created = task_id is not None
         task_error = err
         if err:
@@ -572,9 +575,8 @@ async def req_urgency(update: Update, context: ContextTypes.DEFAULT_TYPE):
         amo_status = "⚠️ Задача в AmoCRM не создана (ученик не найден в AmoCRM)"
 
     # Sync to assistant-data so dashboard shows it
-    today_str = date.today().strftime('%Y-%m-%d')
-    deadline_str = date.today().replace(day=date.today().day + deadline_days).strftime('%Y-%m-%d') \
-        if False else (date.fromordinal(date.today().toordinal() + deadline_days)).strftime('%Y-%m-%d')
+    today_str = deadline.strftime('%Y-%m-%d')
+    deadline_str = today_str
     req_record = {
         'id': str(uuid.uuid4()),
         'student': student_name,
@@ -650,6 +652,42 @@ async def req_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+REQUEST_TASK_MARKER = 'Запрос от родителя'
+
+
+async def send_open_requests_reminder(context: ContextTypes.DEFAULT_TYPE):
+    """Nudge the group about parent requests still open before the day ends."""
+    group_id = ADMIN_GROUP_ID or context.bot_data.get('admin_group_id', '')
+    if not group_id:
+        return
+
+    tasks, error = amo.get_open_tasks_due_today()
+    if error:
+        logger.error(f"get_open_tasks_due_today error: {error}")
+        return
+
+    pending = [t for t in tasks if REQUEST_TASK_MARKER in (t.get('text') or '')]
+    if not pending:
+        return  # Nothing hanging — stay silent
+
+    lines = [f"🔔 *Незакрытые запросы на сегодня: {len(pending)}*\n"]
+    for t in pending[:20]:
+        text = (t.get('text') or '').replace('\n', ' / ')[:120]
+        manager = amo.get_user_name(t.get('responsible_user_id')) or 'Неизвестен'
+        ts = t.get('complete_till')
+        dl = datetime.fromtimestamp(ts, amo.ALMATY_TZ).strftime('%H:%M') if ts else '—'
+        lines.append(f"• {text}\n  👤 {manager} | ⏰ до {dl}")
+
+    try:
+        await context.bot.send_message(
+            chat_id=int(group_id),
+            text='\n'.join(lines),
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        logger.error(f"Reminder send error: {e}")
+
+
 async def send_daily_overdue_report(context: ContextTypes.DEFAULT_TYPE):
     """Daily job: send overdue AmoCRM tasks report to admin group at 9:00 AM."""
     group_id = ADMIN_GROUP_ID or context.bot_data.get('admin_group_id', '')
@@ -714,6 +752,15 @@ def build_application():
         time=dt.time(hour=4, minute=0, tzinfo=dt.timezone.utc),
         name='daily_overdue_report',
     )
+
+    # Nudges at 11:00, 14:00 and 17:00 Almaty (UTC+5) so a request raised in
+    # the morning does not quietly sit until its 18:00 deadline.
+    for hour_utc in (6, 9, 12):
+        app.job_queue.run_daily(
+            send_open_requests_reminder,
+            time=dt.time(hour=hour_utc, minute=0, tzinfo=dt.timezone.utc),
+            name=f'open_requests_reminder_{hour_utc}',
+        )
 
     return app
 
