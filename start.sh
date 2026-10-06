@@ -1,12 +1,7 @@
 #!/bin/bash
 set -e
 
-# Start Telegram bot in background
-python bot.py &
-BOT_PID=$!
-
-# Start webhook server in foreground (keeps container alive)
-python webhook.py
-
-# If webhook exits, kill bot too
-kill $BOT_PID 2>/dev/null || true
+# Single process: FastAPI serves the AMO webhook and hosts the Telegram bot in
+# webhook mode. Running the bot here instead of as a second process keeps one
+# instance per deploy.
+exec python webhook.py

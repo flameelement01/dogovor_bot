@@ -1,21 +1,69 @@
 """
-AMO webhook server — generates contract when deal moves to "ДОГОВОР ПОДПИСАН"
-in the offline Shymkent pipelines.
-Runs as a background thread alongside the Telegram bot.
+HTTP server hosting both the AMO contract webhook and the Telegram bot.
+
+The Telegram bot runs in webhook mode rather than polling: Telegram pushes
+updates here, which also locks out any stray instance still running getUpdates
+on the same token.
 """
 import os
 import re
-import threading
+import hashlib
+from contextlib import asynccontextmanager
 from datetime import date, datetime
 from io import BytesIO
 
 import uvicorn
 from fastapi import FastAPI, Request, Response
+from telegram import BotCommand, Update
 
 import amo
+import bot as bot_module
 from contract_generator import generate_contract
 
-app = FastAPI()
+TG_WEBHOOK_PATH = "/tg/webhook"
+TG_SECRET = hashlib.sha256(bot_module.BOT_TOKEN.encode()).hexdigest()[:32]
+
+
+def _public_base_url() -> str:
+    explicit = os.getenv("WEBHOOK_BASE_URL", "").rstrip("/")
+    if explicit:
+        return explicit
+    return f"https://{os.getenv('FLY_APP_NAME', 'dogovor-bot')}.fly.dev"
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    tg_app = bot_module.build_application()
+    await tg_app.initialize()
+    await tg_app.start()
+    await tg_app.bot.set_webhook(
+        url=_public_base_url() + TG_WEBHOOK_PATH,
+        secret_token=TG_SECRET,
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+    )
+    await tg_app.bot.set_my_commands([
+        BotCommand("zapros", "Запрос от родителя"),
+        BotCommand("start", "Начать"),
+        BotCommand("cancel", "Отменить"),
+    ])
+    app.state.tg_app = tg_app
+    yield
+    await tg_app.bot.delete_webhook()
+    await tg_app.stop()
+    await tg_app.shutdown()
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+@app.post(TG_WEBHOOK_PATH)
+async def telegram_webhook(request: Request):
+    if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != TG_SECRET:
+        return Response("forbidden", status_code=403)
+    tg_app = request.app.state.tg_app
+    await tg_app.process_update(Update.de_json(await request.json(), tg_app.bot))
+    return Response("ok", status_code=200)
 
 # Offline Shymkent pipeline IDs
 TRIGGER_PIPELINES = {3321094, 5410825, 10798670}

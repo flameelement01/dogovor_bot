@@ -675,7 +675,7 @@ async def send_daily_overdue_report(context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Daily report send error: {e}")
 
 
-def main():
+def build_application():
     import datetime as dt
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -708,7 +708,12 @@ def main():
         name='daily_overdue_report',
     )
 
-    print("🤖 Бот запущен!")
+    return app
+
+
+def main():
+    app = build_application()
+    print("🤖 Бот запущен (polling)!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
