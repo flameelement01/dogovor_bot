@@ -14,7 +14,7 @@ AMO_BASE = "https://qadam.amocrm.ru/api/v4"
 PLAN_MIN = 120
 
 MANAGERS = {
-    9400090:  "Зуппарова Умида",
+    9400090:  "Кудайбергенова Райхан",
     9400138:  "Калшабек Нурислам",
     9400162:  "Мухамеджан Аружан",
     13456338: "Мирхан Диас",
@@ -99,8 +99,24 @@ _sheets_cache_ts: float = 0
 SHEETS_TTL = 300  # 5 min
 
 
+_FALLBACK_TOKEN = (
+    "eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiIsImp0aSI6ImU0NTA3NTEyMTg2ZDcxZTUyNThjYWUyODA2MGZkNmQ1"
+    "OTc2NTYyMGExODYwYTg1ODY1MWMzNmFkOTdhYTg0ZDc1MjBlYzc1NjUzOGJhMjRhIn0.eyJhdWQiOiIzZDU1YWMz"
+    "Ny0wOTUwLTRiZjEtYThkNy0yNGNkYzNkMTA3MjAiLCJqdGkiOiJlNDUwNzUxMjE4NmQ3MWU1MjU4Y2FlMjgwNjBm"
+    "ZDZkNTk3NjU2MjBhMTg2MGE4NTg2NTFjMzZhZDk3YWE4NGQ3NTIwZWM3NTY1MzhiYTI0YSIsImlhdCI6MTc4NTM4"
+    "ODUyNSwibmJmIjoxNzg1Mzg4NTI1LCJleHAiOjE5NDMxMzYwMDAsInN1YiI6IjIyNzU2MjEiLCJncmFudF90eXBl"
+    "IjoiIiwiYWNjb3VudF9pZCI6MTg5NTA4NzIsImJhc2VfZG9tYWluIjoiYW1vY3JtLnJ1IiwidmVyc2lvbiI6Miwi"
+    "c2NvcGVzIjpbInB1c2hfbm90aWZpY2F0aW9ucyIsImZpbGVzIiwiY3JtIiwibm90aWZpY2F0aW9ucyJdLCJoYXNo"
+    "X3V1aWQiOiI5MGQ1MjM3ZS0zYjQ0LTQ3YWQtYjQ0Ni05NzAzZmUyZmU1NjkiLCJhcGlfZG9tYWluIjoiYXBpLWIu"
+    "YW1vY3JtLnJ1In0.INChlbuC-n1rh6Okm0_5i3SD4KgLp9pChGRWg1mbBkc2pK5KV_fy1Bl7QqkyJSKsdHECIwaqs"
+    "6IJuncnSsLmCWR2EiXZS4GoZMOlLkNN8oX6n2T1S4QrnKMKYXMhuPOT9iMysgsOX5zCGN5BQhuu8VtWS-M5mOi6ox"
+    "WQ7s3VtiLYimqFUrLOhULGKUWNvXfcHY8uvbLw3SsqNgTMRkBSCkUCo3gCXV_RjRWgasGhtBL1diWfMUMi316fWJ5"
+    "hRdR_FEHZTgKHaFCODKyEI_BCK0ADgzvq6fs36rHaSOq5pRtU7f-nBjYKEtbDHakCPX_d6FKfSHxrVXF598gALbXlcA"
+)
+
 def _headers():
-    return {"Authorization": f"Bearer {os.getenv('AMOCRM_TOKEN', '')}"}
+    token = os.getenv("AMOCRM_TOKEN") or _FALLBACK_TOKEN
+    return {"Authorization": f"Bearer {token}"}
 
 
 def _today_range():
@@ -316,6 +332,43 @@ def _write_to_sheets(row: dict):
         ])
     except Exception as e:
         print(f"[sheets] write error: {e}", flush=True)
+
+
+def append_payment_to_sheets(deal_id: str, student_name: str, amount: int,
+                              grade: str, payment_type: str, manager_name: str) -> bool:
+    """Append a payment row to the manager's fact tab in Google Sheets."""
+    creds_json = os.getenv("GSHEETS_CREDS", "")
+    if not creds_json:
+        return False
+
+    tab_name = None
+    for t in SHEET_TABS:
+        if t.lower() in manager_name.lower() or manager_name.lower() in t.lower():
+            tab_name = t
+            break
+    if not tab_name:
+        print(f"[sheets] no tab for manager={manager_name!r}", flush=True)
+        return False
+
+    today = datetime.now(ASTANA).strftime("%d.%m.%Y")
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+        creds_data = json.loads(creds_json)
+        scopes     = ["https://www.googleapis.com/auth/spreadsheets"]
+        creds      = Credentials.from_service_account_info(creds_data, scopes=scopes)
+        gc         = gspread.authorize(creds)
+        sh         = gc.open_by_key(GSHEETS_ID)
+        ws         = sh.worksheet(tab_name)
+        # Columns: ID | ФИ ребенка | Сумма | Комиссия% | Упало | Класс | Лидоруб | Тип оплаты | Дата | Менеджер
+        ws.append_row([
+            deal_id, student_name, amount, "", "", grade, "", payment_type, today, tab_name
+        ], value_input_option="USER_ENTERED")
+        print(f"[sheets] appended payment to tab={tab_name} deal={deal_id}", flush=True)
+        return True
+    except Exception as e:
+        print(f"[sheets] payment write error: {e}", flush=True)
+        return False
 
 
 def _send_tg(text: str):
@@ -758,8 +811,9 @@ function esc(s) {{
 """
 
 
-_CLOSED_STATUSES = {142, 143}   # AMO: won / lost
-_FIELD_MEETING_DATE = 875373    # Дата встречи (custom field on lead)
+_CLOSED_STATUSES    = {142, 143}   # AMO: won / lost
+_FIELD_MEETING_DATE = 875373       # Дата встречи (custom field on lead)
+_PIPELINE_NEW_SALES = 3321094      # Новые продажи — highest priority
 
 
 def search_responsible(query: str):
@@ -816,13 +870,10 @@ def search_responsible(query: str):
         if lead.get("status_id") not in _CLOSED_STATUSES
         and lead.get("responsible_user_id") in MANAGERS
     ]
-    # Fallback: any active lead (non-Shymkent manager)
-    active_any = [
-        lead for lead in all_fetched
-        if lead.get("status_id") not in _CLOSED_STATUSES
-    ]
-    active = active_shymkent if active_shymkent else active_any
-    logger.info(f"[search] fetched={len(all_fetched)} active(shymkent)={len(active_shymkent)} active(any)={len(active_any)} "
+    # Prioritize "Новые продажи" pipeline over all others
+    active_shymkent.sort(key=lambda l: 0 if l.get("pipeline_id") == _PIPELINE_NEW_SALES else 1)
+    active = active_shymkent
+    logger.info(f"[search] fetched={len(all_fetched)} active(shymkent)={len(active_shymkent)} "
                 f"statuses={[l.get('status_id') for l in all_fetched[:5]]} "
                 f"resp_uids={[l.get('responsible_user_id') for l in all_fetched[:5]]}")
     if not active:
